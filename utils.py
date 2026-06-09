@@ -928,7 +928,11 @@ class TracePlot:
 def save_anim(anim, path, fps=20):
     """Save to .mp4 (ffmpeg) when possible, else fall back to .gif (pillow).
     Returns the path actually written."""
+    import os
     path = str(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     if path.lower().endswith(".mp4"):
         try:
             anim.save(path, writer=FFMpegWriter(fps=fps, bitrate=2400))
@@ -939,33 +943,24 @@ def save_anim(anim, path, fps=20):
     return path
 
 
-def show_anim(anim, fps=15, width=600):
-    """Inline display as a small **palette-optimized GIF** (base64 ``<img>``).
+def show_anim(anim, fps=15, width=600, *, loop=True):
+    """Inline display as a self-contained HTML5 ``<video>`` (base64 mp4).
 
-    Far lighter than ``to_jshtml`` (which embeds one PNG per frame) and, being a
-    plain image, it renders *everywhere* -- including GitHub's notebook viewer.
-    The full-quality ``.mp4`` is written separately by :func:`save_anim`; this
-    only affects the inline preview. Pair with ``plt.close(fig)``.
+    Scrubbable, compact, and renders on the MyST-NB docs site and in Jupyter.
+    Most tutorials call :func:`show_video` (which also saves the mp4 and closes
+    the figure); this thinner helper just embeds an already-built animation.
+    Pair with ``plt.close(fig)``. ``width`` is accepted for backward
+    compatibility but no longer downscales -- the <video> tag is responsive.
     """
-    import base64, os, shutil, subprocess, tempfile
-    from IPython.display import HTML
-
-    tmp = tempfile.mkdtemp()
-    mp4, gif = os.path.join(tmp, "a.mp4"), os.path.join(tmp, "a.gif")
+    import os, tempfile
+    tmp = tempfile.mktemp(suffix=".mp4")
     try:
-        anim.save(mp4, writer=FFMpegWriter(fps=fps))            # render frames once
-        ffmpeg = (shutil.which("ffmpeg")
-                  or plt.rcParams.get("animation.ffmpeg_path") or "ffmpeg")
-        # downscale + single-pass palette for a compact, clean GIF
-        vf = (f"fps={fps},scale={width}:-1:flags=lanczos,"
-              "split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse")
-        subprocess.run([ffmpeg, "-y", "-i", mp4, "-vf", vf, gif],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        data = open(gif, "rb").read()
+        save_anim(anim, tmp, fps=fps)
+        html = _video_html(tmp, loop=loop)
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    b64 = base64.b64encode(data).decode("ascii")
-    return HTML(f'<img src="data:image/gif;base64,{b64}" style="max-width:100%;"/>')
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return html
 
 
 # ---- high-level one-call animations -----------------------------------------
@@ -1447,3 +1442,192 @@ def phase_plot(trajectories, *, xlabel="position  q", ylabel="momentum  p",
     return fig, ax
 
 
+
+# =============================================================================
+# Standardized simulation building blocks
+# -----------------------------------------------------------------------------
+# Every offline tutorial that runs a simulation builds its OWN simulator class
+# (no shared base class / inheritance), but they all follow the same recipe:
+#
+#   1. call `precompute(X, T, ...)` once to get the per-mesh constants,
+#   2. compose a few energy-term helpers (elastic, pins, gravity, inertia,
+#      contact, springs, ...), each exposing `energy(x) / gradient(x) /
+#      hessian(x)` on a flattened column vector `x`,
+#   3. sum the terms ONE PER LINE inside the class's energy/gradient/hessian,
+#   4. drive it with `simkit`'s `newton_solver`.
+#
+# Keeping the term helpers here means the tutorial cells show only the physics.
+# =============================================================================
+import simkit
+import simkit.energies as energies
+
+
+class Precompute:
+    """A plain attribute bag of per-mesh constants (see `precompute`)."""
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def precompute(X, T, ym=1.0, pr=0.0, rho=1.0, gravity=0.0, mu=None, lam=None):
+    """All per-mesh quantities a simulator reuses, computed once.
+
+    Material constants come from Young's modulus `ym` and Poisson ratio `pr`
+    (via `ympr_to_lame`), unless `mu` / `lam` are passed directly.
+
+    Returns a `Precompute` bundle with attributes:
+      n, dim   -- vertex count and spatial dimension
+      J, vol   -- deformation jacobian and per-element volumes
+      mu, lam  -- per-element Lame parameters (one row per element)
+      M_n, M   -- lumped mass (n x n) and its (n*dim) Kronecker form
+      f_g      -- gravity force as a flattened column (zeros if gravity == 0)
+    """
+    n, dim = X.shape
+    if mu is None or lam is None:
+        mu, lam = simkit.ympr_to_lame(ym, pr)
+    M_n = simkit.massmatrix(X, T, rho=rho)
+    M   = sp.sparse.kron(M_n, sp.sparse.eye(dim)).tocsc()
+    f_g = (simkit.gravity_force(X, T, a=gravity, rho=rho).reshape(-1, 1)
+           if gravity else np.zeros((n * dim, 1)))
+    return Precompute(X=X, T=T, n=n, dim=dim,
+                      J=simkit.deformation_jacobian(X, T), vol=simkit.volume(X, T),
+                      mu=np.full((len(T), 1), mu), lam=np.full((len(T), 1), lam),
+                      M_n=M_n, M=M, f_g=f_g)
+
+
+class ElasticEnergy:
+    """Elastic term psi(F(x)) for one material, in vertex form.
+
+    Call `.energy(x, p)` / `.gradient(x, p)` / `.hessian(x, p)` with a flattened
+    column `x` and a `Precompute` bundle `p`. The Hessian is PSD-projected so it
+    is safe for Newton. `make_material` is an alias for the constructor.
+    """
+    def __init__(self, name="Neo-Hookean"):
+        self.name = name
+        if name == "ARAP":                       # ARAP uses only mu
+            self._e = lambda xn, p: energies.arap_energy_x(xn, p.J, p.mu, p.vol)
+            self._g = lambda xn, p: energies.arap_gradient_x(xn, p.J, p.mu, p.vol)
+            self._h = lambda xn, p: energies.arap_hessian_x(xn, p.J, p.mu, p.vol, psd=True)
+        elif name == "Linear":
+            self._e = lambda xn, p: energies.linear_elasticity_energy_x(xn, p.J, p.mu, p.lam, p.vol)
+            self._g = lambda xn, p: energies.linear_elasticity_gradient_x(xn, p.J, p.mu, p.lam, p.vol)
+            self._h = lambda xn, p: energies.linear_elasticity_hessian_x(xn, p.J, p.mu, p.lam, p.vol, psd=True)
+        else:                                    # Neo-Hookean (default)
+            self._e = lambda xn, p: energies.macklin_mueller_neo_hookean_energy_x(xn, p.J, p.mu, p.lam, p.vol)
+            self._g = lambda xn, p: energies.macklin_mueller_neo_hookean_gradient_x(xn, p.J, p.mu, p.lam, p.vol)
+            self._h = lambda xn, p: energies.macklin_mueller_neo_hookean_hessian_x(xn, p.J, p.mu, p.lam, p.vol, psd=True)
+
+    def energy(self, x, p):   return self._e(x.reshape(-1, p.dim), p)
+    def gradient(self, x, p): return self._g(x.reshape(-1, p.dim), p)
+    def hessian(self, x, p):  return self._h(x.reshape(-1, p.dim), p)
+
+
+# `make_material("ARAP" | "Linear" | "Neo-Hookean")` reads nicely in the cells.
+make_material = ElasticEnergy
+
+
+class PenaltySpring:
+    """Soft Dirichlet penalty 1/2 x^T Q x + b^T x pinning chosen vertices to
+    targets. The same object models a fixed pin and a movable handle; call
+    `.set(idx, targets)` to (re)aim it."""
+    def __init__(self, n, dim, K=1e5):
+        self.n, self.dim, self.K = n, dim, K
+        self.set([], np.empty((0, dim)))
+
+    def set(self, idx, targets):
+        idx = np.atleast_1d(np.asarray(idx, int))
+        self.Q, self.b = dirichlet_penalty(idx, np.atleast_2d(targets), self.n, self.K)
+        return self
+
+    def energy(self, x):   return 0.5 * (x.T @ (self.Q @ x))[0, 0] + (self.b.T @ x)[0, 0]
+    def gradient(self, x): return self.Q @ x + self.b
+    def hessian(self, x):  return self.Q
+
+
+class Gravity:
+    """Gravitational potential -f_g^T x. Linear, so it has no Hessian term."""
+    def __init__(self, f_g):
+        self.f_g = f_g
+
+    def energy(self, x):   return -(self.f_g.T @ x)[0, 0]
+    def gradient(self, x): return -self.f_g
+
+
+class Inertia:
+    """Backward-Euler inertia 1/(2h^2) ||x - x_tilde||_M^2 pulling x toward the
+    momentum prediction x_tilde = x_n + h v_n. Call `.update(x_n, v_n)` once at
+    the start of each step before the Newton solve."""
+    def __init__(self, M, h):
+        self.M, self.h = M, h
+        self.target = None
+
+    def update(self, x_n, v_n):
+        self.target = x_n + self.h * v_n
+        return self
+
+    def energy(self, x):
+        d = x - self.target
+        return 0.5 / self.h ** 2 * (d.T @ (self.M @ d))[0, 0]
+
+    def gradient(self, x): return (self.M @ (x - self.target)) / self.h ** 2
+    def hessian(self, x):  return self.M / self.h ** 2
+
+
+class SphereContact:
+    """Penalty contact against a ball: a quadratic spring that switches on for
+    any vertex with signed distance phi(x) = ||x - c|| - r below zero."""
+    def __init__(self, K, radius, M_n, dim, center=(0.0, 0.0)):
+        self.K, self.r, self.M_n, self.dim = K, radius, M_n, dim
+        self.center = np.asarray(center, float)
+
+    def set_center(self, c):
+        self.center = np.asarray(c, float)
+        return self
+
+    def energy(self, x):   return energies.contact_springs_sphere_energy(x.reshape(-1, self.dim), self.K, self.center, self.r, M=self.M_n)
+    def gradient(self, x): return energies.contact_springs_sphere_gradient(x.reshape(-1, self.dim), self.K, self.center, self.r, M=self.M_n)
+    def hessian(self, x):  return energies.contact_springs_sphere_hessian(x.reshape(-1, self.dim), self.K, self.center, self.r, M=self.M_n)
+
+
+class PlaneContact:
+    """Penalty contact against a half-space: a quadratic spring on any vertex
+    that drops below the plane through point `p` with upward normal `n`."""
+    def __init__(self, K, point, normal, M_n, dim):
+        self.K, self.M_n, self.dim = K, M_n, dim
+        self.p, self.n = np.asarray(point, float), np.asarray(normal, float)
+
+    def energy(self, x):   return energies.contact_springs_plane_energy(x.reshape(-1, self.dim), self.K, self.p, self.n, M=self.M_n)
+    def gradient(self, x): return energies.contact_springs_plane_gradient(x.reshape(-1, self.dim), self.K, self.p, self.n, M=self.M_n)
+    def hessian(self, x):  return energies.contact_springs_plane_hessian(x.reshape(-1, self.dim), self.K, self.p, self.n, M=self.M_n)
+
+
+class SpringEnergy:
+    """Mass-spring elastic energy sum_e vol_e * 1/2 k_e (l_e - l0_e)^2, assembled
+    with the stacked edge-vector operator J (so d = J x stacks every edge)."""
+    def __init__(self, J, ym, vol, l0):
+        self.J, self.ym, self.vol, self.l0 = J, ym, vol, l0
+
+    def energy(self, x):   return energies.mass_springs_energy_z(x, self.J, self.ym, self.vol, self.l0)
+    def gradient(self, x): return energies.mass_springs_gradient_z(x, self.J, self.ym, self.vol, self.l0)
+    def hessian(self, x):  return energies.mass_springs_hessian_z(x, self.J, self.ym, self.vol, self.l0, psd=True)
+
+
+# ---- inline HTML5 video (replaces the old base64-GIF preview) ----------------
+
+def _video_html(path, loop=True, autoplay=True):
+    """Read an mp4 and wrap it in a self-contained base64 <video> tag."""
+    import base64
+    from IPython.display import HTML
+    data = open(path, "rb").read()
+    b64 = base64.b64encode(data).decode("ascii")
+    attrs = "controls" + (" autoplay" if autoplay else "") + (" loop" if loop else "") + " muted"
+    return HTML(f'<video {attrs} style="max-width:100%;">'
+                f'<source src="data:video/mp4;base64,{b64}" type="video/mp4"></video>')
+
+
+def show_video(fig, anim, path, *, fps=20, loop=True):
+    """One-call replacement for the old `save_anim` + `plt.close` + `show_anim`
+    trio: save the animation to `path` (mp4), close the building figure, and
+    return an inline, self-contained HTML5 <video> for the notebook output."""
+    save_anim(anim, path, fps=fps)
+    plt.close(fig)
+    return _video_html(path, loop=loop)
