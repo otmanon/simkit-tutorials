@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Notebook / sim runtime artifacts
+results/
+*.npy
+*.npz
+imgui.ini
+.polyscope.ini
+
+# NOTE: media/ (png, gif, mp4) is intentionally tracked here -- the notebooks
+# reference those files and the docs site needs them to render. Do not add a
+# global *.png / *.mp4 ignore.
