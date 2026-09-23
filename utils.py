@@ -1,63 +1,26 @@
-"""Shared scaffolding for the SimKit tutorials.
+"""Plotting and mesh helpers shared by the SimKit tutorial notebooks.
 
-The interesting code -- the simulator, with its energy / gradient / hessian /
-step -- lives inside each tutorial file. This module is just the support layer:
+The physics -- every ``XXX_system`` with its energy / gradient / hessian --
+lives inside the notebooks and is built directly from ``simkit``. This module
+only holds support code that is not the point of any tutorial:
 
-* Mesh generators (``triangulated_grid``, ``tetrahedralized_grid``,
-  ``ball_mesh_2d``) and small numeric helpers (``lame_from_E_nu``,
-  ``screen_to_world_2d``).
-* Polyscope wrappers (``Viewer2D``, ``Viewer3D``) that just register a mesh and
-  expose pin / handle marker point clouds.
-* A 3D mouse handle (``MouseHandle3D``) that picks the nearest vertex on left-
-  click, drags it on a camera-facing plane, and writes the resulting soft-pin
-  ``(Q_h, b_h)`` matrices directly onto the sim object(s).
-* A reusable imgui control panel (``TutorialUI3D``) that draws the standard
-  reset / integrator / dt / material / contact-K / handle-mode controls and
-  propagates their values to every sim it owns.
+* Mesh generators with no simkit / libigl equivalent (``tetrahedralized_grid``,
+  ``ball_mesh_2d``).
+* Matplotlib artists, static plots and one-call animations. Animations return
+  ``(fig, anim)``; save them with ``simkit.filesystem.save_animation`` and embed
+  the saved file with :func:`embed_video`. Save static figures with
+  ``simkit.filesystem.save_figure``.
+* Validation visuals every notebook uses: :func:`plot_mesh` and
+  :func:`plot_scalar_field`.
 """
 from __future__ import annotations
 
 import numpy as np
-import scipy as sp
-
-# Polyscope is only needed by the *interactive* tutorials. The offline
-# notebook tutorials import this module purely for the mesh generators,
-# material conversions, and the matplotlib helpers at the bottom of the file,
-# and may run headless (CI, nbconvert) where polyscope cannot open a window.
-# So we import it lazily and leave ``ps`` / ``psim`` as ``None`` if absent;
-# anything that actually touches polyscope will raise a clear error on use.
-try:
-    import polyscope as ps
-    import polyscope.imgui as psim
-except Exception:  # pragma: no cover - headless / not installed
-    ps = None
-    psim = None
-
-from simkit.dirichlet_penalty import dirichlet_penalty
 
 
 # =============================================================================
 # Mesh generators
 # =============================================================================
-
-def triangulated_grid(nx, ny, width=2.0, height=1.0):
-    """Right-triangulated rectangular grid in the xy-plane, centered on origin."""
-    xs = np.linspace(-width / 2.0, width / 2.0, nx)
-    ys = np.linspace(-height / 2.0, height / 2.0, ny)
-    XX, YY = np.meshgrid(xs, ys, indexing="xy")
-    X = np.stack([XX.ravel(), YY.ravel()], axis=1)
-
-    i, j = np.meshgrid(np.arange(nx - 1), np.arange(ny - 1), indexing="xy")
-    v00 = (j * nx + i).ravel()
-    v01 = (j * nx + i + 1).ravel()
-    v10 = ((j + 1) * nx + i).ravel()
-    v11 = ((j + 1) * nx + i + 1).ravel()
-    T = np.stack([
-        np.stack([v00, v01, v11], axis=1),
-        np.stack([v00, v11, v10], axis=1),
-    ], axis=1).reshape(-1, 3)
-    return X, T
-
 
 def tetrahedralized_grid(nx, ny, nz, width=1.0, height=1.0, depth=1.0):
     """Tet-meshed rectangular brick (5-tet-per-hex, parity-flipped to match faces)."""
@@ -110,619 +73,14 @@ def ball_mesh_2d(radius=0.15, n_segments=48):
     return X, T
 
 
-# =============================================================================
-# Material conversions
-# =============================================================================
 
-def lame_from_E_nu(E, nu):
-    """Young's modulus + Poisson ratio -> (mu, lambda) Lame parameters."""
-    mu_s = E / (2.0 * (1.0 + nu))
-    lam_s = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
-    return mu_s, lam_s
-
-
-# =============================================================================
-# 2D screen-space picking
-# =============================================================================
-
-def screen_to_world_2d(win_pos):
-    """Cursor pixel -> world point on the z=0 plane (used in the 2D demos)."""
-    W, H = ps.get_window_size()
-    u = win_pos[0] / W
-    v = win_pos[1] / H
-    params = ps.get_view_camera_parameters()
-    ul, ur, ll, lr = params.generate_camera_ray_corners()
-    pos = params.get_position()
-    top = (1 - u) * np.array(ul) + u * np.array(ur)
-    bot = (1 - u) * np.array(ll) + u * np.array(lr)
-    ray_dir = (1 - v) * top + v * bot
-    t = -pos[2] / ray_dir[2]
-    return (pos + t * ray_dir)[:2]
-
-
-# =============================================================================
-# Color palette (shared across tutorials)
-# =============================================================================
-
-LIGHT_GREEN = np.array([153, 216, 201]) / 255
-BLUE        = np.array([0.2, 0.4, 0.85])
-RED         = np.array([0.85, 0.2, 0.2])
-GRAY        = np.array([0.4, 0.4, 0.4])
-BLACK       = np.array([0.0, 0.0, 0.0])
-BALL_COLOR  = np.array([0.95, 0.45, 0.35])
-
-
-# =============================================================================
-# RollingPlot - one rolling-window line plot in the imgui sidebar
-# =============================================================================
-
-class RollingPlot:
-    """Append a sample each frame; draw via ``imgui.PlotLines``."""
-
-    def __init__(self, label, length=200, height=120.0, fmt="{:.3f}"):
-        self.label = label
-        self.length = length
-        self.height = height
-        self.fmt = fmt
-        self.values = []
-
-    def push(self, v):
-        self.values.append(float(v))
-        del self.values[: -self.length]
-
-    def clear(self):
-        self.values.clear()
-
-    def draw(self):
-        last = self.values[-1] if self.values else 0.0
-        psim.PlotLines(
-            f"{self.label} (last {self.length})",
-            self.values,
-            overlay_text=f"{self.label}: {self.fmt.format(last)}",
-            graph_size=(0.0, self.height),
-        )
-
-
-# =============================================================================
-# Viewer2D - polyscope wrapper for 2D scenes
-# =============================================================================
-
-def init_2d_scene(camera_distance=5.0, own_mouse=True):
-    """Bare ``ps.init`` + 2D camera setup. Use when you want to manage your own
-    ``register_*`` calls; otherwise use :class:`Viewer2D`.
-    """
-    ps.init()
-    ps.remove_all_structures()
-    ps.look_at(np.array([0, 0, camera_distance]), np.array([0, 0, 0]))
-    ps.set_ground_plane_mode("none")
-    if own_mouse:
-        ps.set_do_default_mouse_interaction(False)
-
-
-class Viewer2D:
-    """Set up polyscope for a 2D simulation tutorial.
-
-    Auto-registers a surface mesh + vertex point cloud and exposes helpers for
-    pin markers, handle markers, custom point clouds and ``ps.show``. Call
-    ``refresh(U)`` from your callback after the sim step.
-    """
-
-    def __init__(self, X, T, camera_distance=5.0, point_radius=0.012,
-                 edge_width=2, mesh_color=None, own_mouse=True):
-        self.dim = X.shape[1]
-        init_2d_scene(camera_distance=camera_distance, own_mouse=own_mouse)
-        color = LIGHT_GREEN if mesh_color is None else mesh_color
-        self.mesh = ps.register_surface_mesh(
-            "mesh", X, T, material="flat", color=color, edge_width=edge_width)
-        self.pc = ps.register_point_cloud(
-            "vertices", X, radius=point_radius, material="flat", color=BLACK)
-
-    def refresh(self, U):
-        self.mesh.update_vertex_positions(U)
-        self.pc.update_point_positions(U)
-
-    def add_pin_markers(self, X_pin, name="pinned", color=None, radius=0.022):
-        return ps.register_point_cloud(
-            name, X_pin, radius=radius, material="flat",
-            color=BLUE if color is None else color)
-
-    def add_handle_markers(self, name="handle", color=None, radius=0.028):
-        c = RED if color is None else color
-        zero = np.zeros((1, self.dim))
-        sel = ps.register_point_cloud(
-            f"{name} selected", zero, radius=radius, material="flat",
-            color=c, enabled=False)
-        tgt = ps.register_point_cloud(
-            f"{name} target", zero, radius=radius, material="flat",
-            color=c, enabled=False)
-        return sel, tgt
-
-    def add_floor_line(self, y, x_range=(-3.0, 3.0), color=None):
-        nodes = np.array([[x_range[0], y, -0.005], [x_range[1], y, -0.005]])
-        edges = np.array([[0, 1]])
-        return ps.register_curve_network(
-            "floor", nodes, edges, material="flat",
-            color=GRAY if color is None else color, radius=0.006)
-
-    def add_ball(self, ball_X, ball_T, center, name="ball", color=None):
-        return ps.register_surface_mesh(
-            name, ball_X + np.asarray(center)[None, :], ball_T, material="flat",
-            color=BALL_COLOR if color is None else color, edge_width=1)
-
-    def show(self, callback):
-        ps.set_user_callback(callback)
-        ps.show()
-
-
-# =============================================================================
-# Viewer3D - polyscope wrapper for 3D scenes
-# =============================================================================
-
-class Viewer3D:
-    """Polyscope wrapper for a 3D tutorial. Registers a volume mesh."""
-
-    def __init__(self, X, T, floor_y=None, mesh_color=None, own_mouse=True,
-                 camera_eye=(2.0, 1.2, 3.5), camera_target=(0.0, 0.0, 0.0)):
-        ps.init()
-        ps.remove_all_structures()
-        ps.set_up_dir("y_up")
-        ps.set_front_dir("z_front")
-        ps.set_ground_plane_mode("tile_reflection" if floor_y is not None else "none")
-        ps.look_at(np.asarray(camera_eye, dtype=float),
-                   np.asarray(camera_target, dtype=float))
-        if own_mouse:
-            ps.set_do_default_mouse_interaction(False)
-
-        color = LIGHT_GREEN if mesh_color is None else mesh_color
-        self.mesh = ps.register_volume_mesh(
-            "block", X, tets=T, color=color, interior_color=color,
-            edge_width=1.0, material="flat")
-
-        if floor_y is not None:
-            bb_lo = np.array([
-                float(X[:, 0].min()) - 1.0, floor_y, float(X[:, 2].min()) - 1.0])
-            bb_hi = np.array([
-                float(X[:, 0].max()) + 1.0,
-                float(X[:, 1].max()) + 1.0,
-                float(X[:, 2].max()) + 1.0])
-            ps.set_automatically_compute_scene_extents(False)
-            ps.set_bounding_box(bb_lo, bb_hi)
-
-    def refresh(self, U):
-        self.mesh.update_vertex_positions(U)
-
-    def add_handle_markers(self, name="handle", color=None, radius=0.012):
-        c = RED if color is None else color
-        zero = np.zeros((1, 3))
-        sel = ps.register_point_cloud(
-            f"{name} selected", zero, radius=radius, material="flat",
-            color=c, enabled=False)
-        tgt = ps.register_point_cloud(
-            f"{name} target", zero, radius=radius, material="flat",
-            color=c, enabled=False)
-        return sel, tgt
-
-    def show(self, callback):
-        ps.set_user_callback(callback)
-        ps.show()
-
-
-# =============================================================================
-# Mouse handles - pick a vertex, drag, write soft-pin (Q_h, b_h) onto every
-# sim they manage so any of them can be stepped without further plumbing.
-# =============================================================================
-
-class MouseHandle2D:
-    """2D click-and-drag handle. Picks the nearest vertex within ``pick_radius``
-    and follows the cursor on the z=0 plane. Writes ``Q_h`` / ``b_h`` onto every
-    sim it owns; release zeros them again.
-    """
-
-    def __init__(self, sims, sel_pc=None, target_pc=None,
-                 K_handle=1e4, pick_radius=0.15):
-        self.sims = sims if isinstance(sims, dict) else {"_": sims}
-        self.sim = next(iter(self.sims.values()))
-        self.sel_pc = sel_pc
-        self.target_pc = target_pc
-        self.K_handle = float(K_handle)
-        self.pick_radius = float(pick_radius)
-        self.n = self.sim.n
-        self.dim = self.sim.dim
-        self.D = self.n * self.dim
-        self.idx = None
-        self.target = None
-        self.status = "left-click a vertex to grab; drag to move; release to drop"
-
-    def update(self):
-        win_pos = psim.GetMousePos()
-        if psim.IsMouseClicked(0):
-            pos = screen_to_world_2d(win_pos)
-            dist = np.linalg.norm(self.sim.U - pos.reshape(-1, 2), axis=1)
-            nearest = int(np.argmin(dist))
-            if dist[nearest] < self.pick_radius:
-                self.idx = nearest
-                self.target = self.sim.U[nearest].copy()
-                self._write_handle()
-                self._set_markers_enabled(True)
-                self.status = f"grabbed vertex {nearest}"
-        if self.idx is not None and psim.IsMouseDown(0):
-            self.target = screen_to_world_2d(win_pos)[: self.dim].astype(float).copy()
-            self._write_handle()
-        if psim.IsMouseReleased(0):
-            if self.idx is not None:
-                self.status = "released - click another vertex to grab again"
-            self._clear()
-
-    def refresh_markers(self):
-        if self.idx is None:
-            return
-        if self.sel_pc is not None:
-            self.sel_pc.update_point_positions(
-                self.sim.U[self.idx].reshape(1, self.dim))
-        if self.target_pc is not None:
-            self.target_pc.update_point_positions(
-                self.target.reshape(1, self.dim))
-
-    def _write_handle(self):
-        bI = np.array([self.idx])
-        y = self.target.reshape(1, self.dim)
-        Q, b = dirichlet_penalty(bI, y, self.n, self.K_handle)
-        for s in self.sims.values():
-            s.Q_h = Q
-            s.b_h = b
-
-    def _clear(self):
-        self.idx = None
-        self.target = None
-        self._set_markers_enabled(False)
-        Q0 = sp.sparse.csc_matrix((self.D, self.D))
-        b0 = np.zeros((self.D, 1))
-        for s in self.sims.values():
-            s.Q_h = Q0
-            s.b_h = b0
-
-    def _set_markers_enabled(self, on):
-        if self.sel_pc is not None:
-            self.sel_pc.set_enabled(on)
-        if self.target_pc is not None:
-            self.target_pc.set_enabled(on)
-
-
-# -----------------------------------------------------------------------------
-# 3D handle: drags on a camera-facing plane through the picked point.
-# -----------------------------------------------------------------------------
-
-def _is_finite(p):
-    return p is not None and np.all(np.isfinite(p))
-
-
-def _pick_world_point(win_pos):
-    try:
-        p = ps.screen_coords_to_world_position(np.asarray(win_pos, dtype=float))
-    except Exception:
-        return None
-    p = np.asarray(p, dtype=float)
-    return p if _is_finite(p) else None
-
-
-def _cursor_ray(win_pos):
-    params = ps.get_view_camera_parameters()
-    cam_pos = np.asarray(params.get_position(), dtype=float)
-    ray_dir = np.asarray(
-        ps.screen_coords_to_world_ray(np.asarray(win_pos, dtype=float)), dtype=float)
-    nrm = np.linalg.norm(ray_dir)
-    if nrm > 0:
-        ray_dir = ray_dir / nrm
-    return cam_pos, ray_dir
-
-
-def _ray_plane(ray_o, ray_d, plane_p, plane_n):
-    denom = float(np.dot(ray_d, plane_n))
-    if abs(denom) < 1e-9:
-        return None
-    t = float(np.dot(plane_p - ray_o, plane_n) / denom)
-    return ray_o + t * ray_d
-
-
-class MouseHandle3D:
-    """3D click-and-drag handle.
-
-    Accepts either a single sim or a dict ``{name: sim}``. On left-click it
-    finds the nearest vertex of ``self.sim.U``; while held, it intersects the
-    cursor ray with a camera-facing plane through the picked point and writes
-    the corresponding soft-pin matrices ``sim.Q_h`` / ``sim.b_h`` onto every
-    sim it owns. Release zeros them again.
-
-    ``self.sim`` is the picking source; ``TutorialUI3D`` re-points it when the
-    user switches integrators so the picked vertex is always read off the
-    just-stepped state.
-    """
-
-    def __init__(self, sims, sel_pc=None, target_pc=None, K_handle=1e4):
-        self.sims = sims if isinstance(sims, dict) else {"_": sims}
-        self.sim = next(iter(self.sims.values()))
-        self.sel_pc = sel_pc
-        self.target_pc = target_pc
-        self.K_handle = float(K_handle)
-        self.n = self.sim.n
-        self.dim = self.sim.dim
-        self.D = self.n * self.dim
-
-        self.idx = None
-        self.target = None
-        self._plane_p = None
-        self._plane_n = None
-        self.status = "left-click a vertex to grab; drag to move; release to drop"
-
-    # ---- public API used by tutorials -------------------------------------
-    def update(self):
-        win_pos = psim.GetMousePos()
-        if psim.IsMouseClicked(0):
-            hit = _pick_world_point(win_pos)
-            if hit is None:
-                self._clear()
-                self.status = "click landed on empty space"
-            else:
-                d = np.linalg.norm(self.sim.U - hit.reshape(1, self.dim), axis=1)
-                nearest = int(np.argmin(d))
-                self.idx = nearest
-                self.target = self.sim.U[nearest].copy()
-                self._write_handle()
-                self._plane_p = hit.copy()
-                self._plane_n = np.asarray(
-                    ps.get_view_camera_parameters().get_look_dir(), dtype=float)
-                self._set_markers_enabled(True)
-                self.status = f"grabbed vertex {nearest}"
-        if self.idx is not None and psim.IsMouseDown(0):
-            ray_o, ray_d = _cursor_ray(win_pos)
-            new_target = _ray_plane(ray_o, ray_d, self._plane_p, self._plane_n)
-            if _is_finite(new_target):
-                self.target = np.asarray(new_target, dtype=float).copy()
-                self._write_handle()
-        if psim.IsMouseReleased(0):
-            if self.idx is not None:
-                self.status = "released - click another vertex to grab again"
-            self._clear()
-
-    def refresh_markers(self):
-        if self.idx is None:
-            return
-        if self.sel_pc is not None:
-            self.sel_pc.update_point_positions(
-                self.sim.U[self.idx].reshape(1, self.dim))
-        if self.target_pc is not None:
-            self.target_pc.update_point_positions(
-                self.target.reshape(1, self.dim))
-
-    # ---- internals --------------------------------------------------------
-    def _write_handle(self):
-        bI = np.array([self.idx])
-        y = self.target.reshape(1, self.dim)
-        Q, b = dirichlet_penalty(bI, y, self.n, self.K_handle)
-        for s in self.sims.values():
-            s.Q_h = Q
-            s.b_h = b
-
-    def _clear(self):
-        self.idx = None
-        self.target = None
-        self._plane_p = None
-        self._plane_n = None
-        self._set_markers_enabled(False)
-        Q0 = sp.sparse.csc_matrix((self.D, self.D))
-        b0 = np.zeros((self.D, 1))
-        for s in self.sims.values():
-            s.Q_h = Q0
-            s.b_h = b0
-
-    def _set_markers_enabled(self, on):
-        if self.sel_pc is not None:
-            self.sel_pc.set_enabled(on)
-        if self.target_pc is not None:
-            self.target_pc.set_enabled(on)
-
-
-# =============================================================================
-# TutorialUI - configurable imgui control panel.
-# =============================================================================
-
-class TutorialUI:
-    """Imgui control panel that owns slider state and propagates changes.
-
-    Pass a dict ``{name: sim}`` of one sim per integrator. ``draw()`` emits the
-    enabled controls (reset / integrator / dt / E + nu / K_contact / handle-vs-
-    camera) and writes their values to every sim. ``self.sim`` is the active
-    integrator; the tutorial callback steps that one.
-
-    Flags
-    -----
-    show_integrator : bool
-        Combo to pick the active integrator. State is copied from the previous
-        active sim on switch (history slots are reset to the handed-off pose).
-    show_dt : bool
-        ``dt (h)`` slider; mirrored onto every sim's ``.h``.
-    show_material : bool
-        ``log10 E`` and ``log10 (0.5 - nu)`` sliders; mirrored onto each
-        sim's ``.mu`` / ``.lam`` arrays.
-    show_contact_K : bool
-        ``log10 K_contact`` slider; mirrored onto each sim's ``.K_contact``.
-    show_handle_mode : bool
-        3D only: checkbox to swap between handle-grab and orbit-camera mouse
-        ownership.
-    """
-
-    def __init__(self, sims, handle=None, *,
-                 show_integrator=True, show_dt=True, show_material=True,
-                 show_contact_K=False, show_handle_mode=False,
-                 log_E=5.0, log_nu_compl=-1.0, log_K_contact=5.0,
-                 h=0.02, dt_range=(0.001, 0.05), handle_enabled=True):
-        self.sims = sims
-        self.names = list(sims.keys())
-        self.handle = handle
-        self.active_idx = 0
-
-        self.show_integrator = show_integrator
-        self.show_dt = show_dt
-        self.show_material = show_material
-        self.show_contact_K = show_contact_K
-        self.show_handle_mode = show_handle_mode
-
-        self.log_E = log_E
-        self.log_nu_compl = log_nu_compl
-        self.log_K_contact = log_K_contact
-        self.h = h
-        self.dt_min, self.dt_max = dt_range
-        self.handle_enabled = handle_enabled
-        self.status = ""
-        self.reset_hooks = []   # extra cleanups to run on Reset (plot.clear, etc.)
-        self.switch_hooks = []  # extra cleanups to run on integrator switch
-
-        # push initial slider values onto sims so they match the UI state
-        if show_material:
-            self._apply_material()
-        if show_contact_K:
-            self._apply_contact_K()
-        if show_dt:
-            self._apply_h()
-
-    @property
-    def sim(self):
-        return self.sims[self.names[self.active_idx]]
-
-    def on_reset(self, fn):
-        """Register an extra callback invoked when the Reset button is clicked."""
-        self.reset_hooks.append(fn)
-
-    def on_switch(self, fn):
-        """Register an extra callback invoked when the integrator changes."""
-        self.switch_hooks.append(fn)
-
-    def draw(self):
-        if psim.Button("Reset"):
-            self._reset_all()
-
-        if self.show_handle_mode and self.handle is not None:
-            psim.SameLine()
-            changed_mode, self.handle_enabled = psim.Checkbox(
-                "Click-to-drag handle (uncheck for camera)", self.handle_enabled)
-            if changed_mode:
-                ps.set_do_default_mouse_interaction(not self.handle_enabled)
-                self.handle._clear()
-                self.status = ("handle mode: click a vertex to grab"
-                               if self.handle_enabled
-                               else "camera mode: polyscope owns the mouse")
-
-        if self.show_integrator:
-            old_idx = self.active_idx
-            changed_int, self.active_idx = psim.Combo(
-                "Integrator", self.active_idx, self.names)
-            if changed_int:
-                self._switch_integrator(old_idx)
-
-        if self.show_dt:
-            changed_h, self.h = psim.SliderFloat(
-                "dt (h)", self.h, v_min=self.dt_min, v_max=self.dt_max)
-            if changed_h:
-                self._apply_h()
-
-        if self.show_material:
-            E_val = 10.0 ** self.log_E
-            nu_val = 0.5 - 10.0 ** self.log_nu_compl
-            changed_E, self.log_E = psim.SliderFloat(
-                f"log10 Young's E  (E = {E_val:.2e})",
-                self.log_E, v_min=2.0, v_max=8.0)
-            changed_nu, self.log_nu_compl = psim.SliderFloat(
-                f"log10 (0.5 - nu)  (nu = {nu_val:.4f})",
-                self.log_nu_compl, v_min=-4.0, v_max=-0.31)
-            if changed_E or changed_nu:
-                self._apply_material()
-
-        if self.show_contact_K:
-            K_val = 10.0 ** self.log_K_contact
-            changed_K, self.log_K_contact = psim.SliderFloat(
-                f"log10 contact penalty  (K = {K_val:.2e})",
-                self.log_K_contact, v_min=2.0, v_max=9.0)
-            if changed_K:
-                self._apply_contact_K()
-
-        msg = self.status or (self.handle.status if self.handle else "")
-        if msg:
-            psim.Text(msg)
-
-    # ------- writes that fan out to every sim -------------------------------
-    def _apply_h(self):
-        for s in self.sims.values():
-            s.h = float(self.h)
-
-    def _apply_material(self):
-        E_val = 10.0 ** self.log_E
-        nu_val = 0.5 - 10.0 ** self.log_nu_compl
-        mu, lam = lame_from_E_nu(E_val, nu_val)
-        for s in self.sims.values():
-            if hasattr(s, "mu") and hasattr(s.mu, "__setitem__"):
-                s.mu[:] = mu
-                s.lam[:] = lam
-
-    def _apply_contact_K(self):
-        K = 10.0 ** self.log_K_contact
-        for s in self.sims.values():
-            if hasattr(s, "K_contact"):
-                s.K_contact = float(K)
-
-    # ------- integrator switch + reset -------------------------------------
-    def _switch_integrator(self, old_idx):
-        old = self.sims[self.names[old_idx]]
-        new = self.sim
-        new.U[:] = old.U
-        # reset history: every prev slot starts at the just-handed-off pose
-        for attr in ("U_prev", "U_prev2", "U_prev3"):
-            if hasattr(new, attr):
-                getattr(new, attr)[:] = old.U
-        if hasattr(new, "V"):
-            new.V[:] = 0.0
-        if self.handle is not None:
-            self.handle.sim = new
-            self.handle._clear()
-        for fn in self.switch_hooks:
-            fn()
-
-    def _reset_all(self):
-        for s in self.sims.values():
-            s.U[:] = s.X
-            for attr in ("U_prev", "U_prev2", "U_prev3"):
-                if hasattr(s, attr):
-                    getattr(s, attr)[:] = s.X
-            if hasattr(s, "V"):
-                s.V[:] = 0.0
-        if self.handle is not None:
-            self.handle._clear()
-        for fn in self.reset_hooks:
-            fn()
-        self.status = "scene reset"
-
-
-# =============================================================================
-# =============================================================================
-# Matplotlib helpers for the OFFLINE notebook tutorials.
-#
-# Everything below is pure matplotlib -- no polyscope, no imgui. The notebooks
-# keep the *physics* visible (deformation gradients, energies, Newton / GD
-# loops) and lean on these helpers for the drawing / animation plumbing so the
-# narrative isn't drowned in plotting boilerplate.
-#
-# Conventions
-# -----------
-# * A "state" is an (n, 2) array of deformed vertex positions.
-# * "states" is a list/array of such frames, one per animation step.
-# * Material colors are shared across every plot so the same energy always has
-#   the same color.
 # =============================================================================
 # =============================================================================
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
 from matplotlib.collections import PolyCollection, LineCollection
-from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
+from matplotlib.animation import FuncAnimation
 
 # Embed reasonably long inline animations in notebooks.
 plt.rcParams["animation.embed_limit"] = 100.0
@@ -921,46 +279,6 @@ class TracePlot:
         for name, ys in self.series.items():
             self.lines[name].set_data(self.xs[:j], ys[:j])
             self.marks[name].set_data([self.xs[i]], [ys[i]])
-
-
-# ---- saving / embedding -----------------------------------------------------
-
-def save_anim(anim, path, fps=20):
-    """Save to .mp4 (ffmpeg) when possible, else fall back to .gif (pillow).
-    Returns the path actually written."""
-    import os
-    path = str(path)
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    if path.lower().endswith(".mp4"):
-        try:
-            anim.save(path, writer=FFMpegWriter(fps=fps, bitrate=2400))
-            return path
-        except Exception:
-            path = path[:-4] + ".gif"
-    anim.save(path, writer=PillowWriter(fps=fps))
-    return path
-
-
-def show_anim(anim, fps=15, width=600, *, loop=True):
-    """Inline display as a self-contained HTML5 ``<video>`` (base64 mp4).
-
-    Scrubbable, compact, and renders on the MyST-NB docs site and in Jupyter.
-    Most tutorials call :func:`show_video` (which also saves the mp4 and closes
-    the figure); this thinner helper just embeds an already-built animation.
-    Pair with ``plt.close(fig)``. ``width`` is accepted for backward
-    compatibility but no longer downscales -- the <video> tag is responsive.
-    """
-    import os, tempfile
-    tmp = tempfile.mktemp(suffix=".mp4")
-    try:
-        save_anim(anim, tmp, fps=fps)
-        html = _video_html(tmp, loop=loop)
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-    return html
 
 
 # ---- high-level one-call animations -----------------------------------------
@@ -1443,178 +761,72 @@ def phase_plot(trajectories, *, xlabel="position  q", ylabel="momentum  p",
 
 
 
+
+
 # =============================================================================
-# Standardized simulation building blocks
-# -----------------------------------------------------------------------------
-# Every offline tutorial that runs a simulation builds its OWN simulator class
-# (no shared base class / inheritance), but they all follow the same recipe:
-#
-#   1. call `precompute(X, T, ...)` once to get the per-mesh constants,
-#   2. compose a few energy-term helpers (elastic, pins, gravity, inertia,
-#      contact, springs, ...), each exposing `energy(x) / gradient(x) /
-#      hessian(x)` on a flattened column vector `x`,
-#   3. sum the terms ONE PER LINE inside the class's energy/gradient/hessian,
-#   4. drive it with `simkit`'s `newton_solver`.
-#
-# Keeping the term helpers here means the tutorial cells show only the physics.
+# Validation visuals: meshes, scalar fields, embedded videos
 # =============================================================================
-import simkit
-import simkit.energies as energies
 
+def plot_mesh(ax, X, T, *, pins=None, handles=None, title=None, lims=None,
+              facecolor=MESH_FACE, edgecolor=MESH_EDGE, lw=0.8, show_vertices=False):
+    """Draw a 2D triangle mesh with its edges, marking pinned / handle vertices.
 
-class Precompute:
-    """A plain attribute bag of per-mesh constants (see `precompute`)."""
-    def __init__(self, **kw):
-        self.__dict__.update(kw)
-
-
-def precompute(X, T, ym=1.0, pr=0.0, rho=1.0, gravity=0.0, mu=None, lam=None):
-    """All per-mesh quantities a simulator reuses, computed once.
-
-    Material constants come from Young's modulus `ym` and Poisson ratio `pr`
-    (via `ympr_to_lame`), unless `mu` / `lam` are passed directly.
-
-    Returns a `Precompute` bundle with attributes:
-      n, dim   -- vertex count and spatial dimension
-      J, vol   -- deformation jacobian and per-element volumes
-      mu, lam  -- per-element Lame parameters (one row per element)
-      M_n, M   -- lumped mass (n x n) and its (n*dim) Kronecker form
-      f_g      -- gravity force as a flattened column (zeros if gravity == 0)
+    ``pins`` and ``handles`` are vertex-index arrays. Returns the
+    :class:`PolyMeshArtist` so the caller can ``update`` it.
     """
-    n, dim = X.shape
-    if mu is None or lam is None:
-        mu, lam = simkit.ympr_to_lame(ym, pr)
-    M_n = simkit.massmatrix(X, T, rho=rho)
-    M   = sp.sparse.kron(M_n, sp.sparse.eye(dim)).tocsc()
-    f_g = (simkit.gravity_force(X, T, a=gravity, rho=rho).reshape(-1, 1)
-           if gravity else np.zeros((n * dim, 1)))
-    return Precompute(X=X, T=T, n=n, dim=dim,
-                      J=simkit.deformation_jacobian(X, T), vol=simkit.volume(X, T),
-                      mu=np.full((len(T), 1), mu), lam=np.full((len(T), 1), lam),
-                      M_n=M_n, M=M, f_g=f_g)
+    X = np.asarray(X, dtype=float)
+    art = PolyMeshArtist(ax, X, T, facecolor=facecolor, edgecolor=edgecolor, lw=lw)
+    if show_vertices:
+        ax.scatter(X[:, 0], X[:, 1], s=6, color=edgecolor, zorder=3)
+    if pins is not None and len(np.atleast_1d(pins)):
+        P = X[np.atleast_1d(pins)]
+        ax.scatter(P[:, 0], P[:, 1], s=28, marker="s", color=PIN_C, zorder=4, label="pinned")
+    if handles is not None and len(np.atleast_1d(handles)):
+        H = X[np.atleast_1d(handles)]
+        ax.scatter(H[:, 0], H[:, 1], s=34, color=HANDLE_C, zorder=5, label="handle")
+    setup_axes(ax, *(lims if lims is not None else auto_limits([X], pad=0.1)), title=title)
+    if pins is not None or handles is not None:
+        ax.legend(loc="upper right", fontsize=8)
+    return art
 
 
-class ElasticEnergy:
-    """Elastic term psi(F(x)) for one material, in vertex form.
+def plot_scalar_field(ax, X, T, values, *, title=None, cmap="viridis", lims=None,
+                      vmin=None, vmax=None, norm=None, edges=True, colorbar=True, label=None):
+    """Color a 2D triangle mesh by a scalar field.
 
-    Call `.energy(x, p)` / `.gradient(x, p)` / `.hessian(x, p)` with a flattened
-    column `x` and a `Precompute` bundle `p`. The Hessian is PSD-projected so it
-    is safe for Newton. `make_material` is an alias for the constructor.
+    ``values`` may be per-vertex (length ``len(X)``, smoothly interpolated) or
+    per-element (length ``len(T)``, flat per triangle). Returns the mappable.
     """
-    def __init__(self, name="Neo-Hookean"):
-        self.name = name
-        if name == "ARAP":                       # ARAP uses only mu
-            self._e = lambda xn, p: energies.arap_energy_x(xn, p.J, p.mu, p.vol)
-            self._g = lambda xn, p: energies.arap_gradient_x(xn, p.J, p.mu, p.vol)
-            self._h = lambda xn, p: energies.arap_hessian_x(xn, p.J, p.mu, p.vol, psd=True)
-        elif name == "Linear":
-            self._e = lambda xn, p: energies.linear_elasticity_energy_x(xn, p.J, p.mu, p.lam, p.vol)
-            self._g = lambda xn, p: energies.linear_elasticity_gradient_x(xn, p.J, p.mu, p.lam, p.vol)
-            self._h = lambda xn, p: energies.linear_elasticity_hessian_x(xn, p.J, p.mu, p.lam, p.vol, psd=True)
-        else:                                    # Neo-Hookean (default)
-            self._e = lambda xn, p: energies.macklin_mueller_neo_hookean_energy_x(xn, p.J, p.mu, p.lam, p.vol)
-            self._g = lambda xn, p: energies.macklin_mueller_neo_hookean_gradient_x(xn, p.J, p.mu, p.lam, p.vol)
-            self._h = lambda xn, p: energies.macklin_mueller_neo_hookean_hessian_x(xn, p.J, p.mu, p.lam, p.vol, psd=True)
-
-    def energy(self, x, p):   return self._e(x.reshape(-1, p.dim), p)
-    def gradient(self, x, p): return self._g(x.reshape(-1, p.dim), p)
-    def hessian(self, x, p):  return self._h(x.reshape(-1, p.dim), p)
-
-
-# `make_material("ARAP" | "Linear" | "Neo-Hookean")` reads nicely in the cells.
-make_material = ElasticEnergy
+    X = np.asarray(X, dtype=float)
+    T = np.asarray(T)
+    values = np.asarray(values, dtype=float).ravel()
+    if values.shape[0] == X.shape[0] and values.shape[0] != T.shape[0]:
+        m = ax.tripcolor(X[:, 0], X[:, 1], T, values, shading="gouraud", cmap=cmap,
+                         vmin=vmin, vmax=vmax, norm=norm)
+    else:
+        m = PolyCollection([X[f] for f in T], array=values, cmap=cmap, norm=norm)
+        if norm is None:
+            m.set_clim(vmin, vmax)
+        ax.add_collection(m)
+    if edges:
+        ax.add_collection(PolyCollection([X[f] for f in T], facecolors="none",
+                                         edgecolors="0.3", linewidths=0.25, zorder=3))
+    setup_axes(ax, *(lims if lims is not None else auto_limits([X], pad=0.1)),
+               title=title, grid=False)
+    if colorbar:
+        ax.figure.colorbar(m, ax=ax, shrink=0.8, label=label)
+    return m
 
 
-class PenaltySpring:
-    """Soft Dirichlet penalty 1/2 x^T Q x + b^T x pinning chosen vertices to
-    targets. The same object models a fixed pin and a movable handle; call
-    `.set(idx, targets)` to (re)aim it."""
-    def __init__(self, n, dim, K=1e5):
-        self.n, self.dim, self.K = n, dim, K
-        self.set([], np.empty((0, dim)))
+def embed_video(path, *, loop=True, autoplay=True):
+    """Inline, self-contained HTML5 ``<video>`` (base64) of a saved mp4.
 
-    def set(self, idx, targets):
-        idx = np.atleast_1d(np.asarray(idx, int))
-        self.Q, self.b = dirichlet_penalty(idx, np.atleast_2d(targets), self.n, self.K)
-        return self
+    Pair with ``simkit.filesystem.save_animation``::
 
-    def energy(self, x):   return 0.5 * (x.T @ (self.Q @ x))[0, 0] + (self.b.T @ x)[0, 0]
-    def gradient(self, x): return self.Q @ x + self.b
-    def hessian(self, x):  return self.Q
-
-
-class Gravity:
-    """Gravitational potential -f_g^T x. Linear, so it has no Hessian term."""
-    def __init__(self, f_g):
-        self.f_g = f_g
-
-    def energy(self, x):   return -(self.f_g.T @ x)[0, 0]
-    def gradient(self, x): return -self.f_g
-
-
-class Inertia:
-    """Backward-Euler inertia 1/(2h^2) ||x - x_tilde||_M^2 pulling x toward the
-    momentum prediction x_tilde = x_n + h v_n. Call `.update(x_n, v_n)` once at
-    the start of each step before the Newton solve."""
-    def __init__(self, M, h):
-        self.M, self.h = M, h
-        self.target = None
-
-    def update(self, x_n, v_n):
-        self.target = x_n + self.h * v_n
-        return self
-
-    def energy(self, x):
-        d = x - self.target
-        return 0.5 / self.h ** 2 * (d.T @ (self.M @ d))[0, 0]
-
-    def gradient(self, x): return (self.M @ (x - self.target)) / self.h ** 2
-    def hessian(self, x):  return self.M / self.h ** 2
-
-
-class SphereContact:
-    """Penalty contact against a ball: a quadratic spring that switches on for
-    any vertex with signed distance phi(x) = ||x - c|| - r below zero."""
-    def __init__(self, K, radius, M_n, dim, center=(0.0, 0.0)):
-        self.K, self.r, self.M_n, self.dim = K, radius, M_n, dim
-        self.center = np.asarray(center, float)
-
-    def set_center(self, c):
-        self.center = np.asarray(c, float)
-        return self
-
-    def energy(self, x):   return energies.contact_springs_sphere_energy(x.reshape(-1, self.dim), self.K, self.center, self.r, M=self.M_n)
-    def gradient(self, x): return energies.contact_springs_sphere_gradient(x.reshape(-1, self.dim), self.K, self.center, self.r, M=self.M_n)
-    def hessian(self, x):  return energies.contact_springs_sphere_hessian(x.reshape(-1, self.dim), self.K, self.center, self.r, M=self.M_n)
-
-
-class PlaneContact:
-    """Penalty contact against a half-space: a quadratic spring on any vertex
-    that drops below the plane through point `p` with upward normal `n`."""
-    def __init__(self, K, point, normal, M_n, dim):
-        self.K, self.M_n, self.dim = K, M_n, dim
-        self.p, self.n = np.asarray(point, float), np.asarray(normal, float)
-
-    def energy(self, x):   return energies.contact_springs_plane_energy(x.reshape(-1, self.dim), self.K, self.p, self.n, M=self.M_n)
-    def gradient(self, x): return energies.contact_springs_plane_gradient(x.reshape(-1, self.dim), self.K, self.p, self.n, M=self.M_n)
-    def hessian(self, x):  return energies.contact_springs_plane_hessian(x.reshape(-1, self.dim), self.K, self.p, self.n, M=self.M_n)
-
-
-class SpringEnergy:
-    """Mass-spring elastic energy sum_e vol_e * 1/2 k_e (l_e - l0_e)^2, assembled
-    with the stacked edge-vector operator J (so d = J x stacks every edge)."""
-    def __init__(self, J, ym, vol, l0):
-        self.J, self.ym, self.vol, self.l0 = J, ym, vol, l0
-
-    def energy(self, x):   return energies.mass_springs_energy_z(x, self.J, self.ym, self.vol, self.l0)
-    def gradient(self, x): return energies.mass_springs_gradient_z(x, self.J, self.ym, self.vol, self.l0)
-    def hessian(self, x):  return energies.mass_springs_hessian_z(x, self.J, self.ym, self.vol, self.l0, psd=True)
-
-
-# ---- inline HTML5 video (replaces the old base64-GIF preview) ----------------
-
-def _video_html(path, loop=True, autoplay=True):
-    """Read an mp4 and wrap it in a self-contained base64 <video> tag."""
+        path = simkit.filesystem.save_animation(anim, out_path, fps=FPS, copy_to=media_path)
+        plt.close(fig)
+        utils.embed_video(path)
+    """
     import base64
     from IPython.display import HTML
     data = open(path, "rb").read()
@@ -1623,11 +835,684 @@ def _video_html(path, loop=True, autoplay=True):
     return HTML(f'<video {attrs} style="max-width:100%;">'
                 f'<source src="data:video/mp4;base64,{b64}" type="video/mp4"></video>')
 
+# =============================================================================
+# Notebook-contributed helpers (non-crucial support code, rule 6)
+# =============================================================================
 
-def show_video(fig, anim, path, *, fps=20, loop=True):
-    """One-call replacement for the old `save_anim` + `plt.close` + `show_anim`
-    trio: save the animation to `path` (mp4), close the building figure, and
-    return an inline, self-contained HTML5 <video> for the notebook output."""
-    save_anim(anim, path, fps=fps)
-    plt.close(fig)
-    return _video_html(path, loop=loop)
+
+def states_at_times(ts, states, sample_times):
+    """Pick, for each requested time, the first recorded state at or after it.
+
+    ``ts`` is the increasing array of recorded times and ``states[k]`` the state at
+    ``ts[k]``. Times past the end of the record hold the last state (for example a
+    run that stopped early because it blew up). Returns a list, handy as the
+    per-frame ``states`` of the ``animate_*`` helpers.
+    """
+    ts = np.asarray(ts, dtype=float)
+    idx = np.searchsorted(ts, np.asarray(sample_times, dtype=float) - 1e-9 * (ts[-1] - ts[0] + 1.0))
+    idx = np.clip(idx, 0, len(ts) - 1)
+    return [states[i] for i in idx]
+
+
+def residual_plot(series, xs=None, *, ax=None, colors=None, xlabel="", ylabel="",
+                  title=None, ylim=None, markers=False, stagger=True, figsize=(6.5, 4.2)):
+    """Semilog-y plot of residual-like curves (constraint violations, gradient norms).
+
+    ``series`` maps a label to a y-array. ``xs`` is a shared x-array, or ``None`` to
+    plot each series against its own index (e.g. per-iteration gradient norms of
+    solves with different iteration counts). Exact zeros are masked instead of
+    dragging the log axis down. With ``stagger`` (default), each later series is
+    drawn dashed and thinner, so curves that coincide stay distinguishable.
+    ``colors`` maps a label to a color. Returns ``(fig, ax)``.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+    colors = colors or {}
+    styles = ["-", "--", ":", "-."]
+    for k, (name, ys) in enumerate(series.items()):
+        ys = np.asarray(ys, dtype=float)
+        ys = np.where(ys > 0, ys, np.nan)
+        x = np.arange(len(ys)) if xs is None else np.asarray(xs, dtype=float)
+        ls = styles[k % len(styles)] if stagger else "-"
+        lw = 2.6 - 0.6 * min(k, 2) if stagger else 2.0
+        ax.semilogy(x, ys, ls, marker="o" if markers else None, ms=4, lw=lw,
+                    color=colors.get(name), label=name)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+    ax.grid(True, which="both", color="0.9", linewidth=0.7)
+    if len(series) > 1:
+        ax.legend(loc="best", fontsize=9)
+    return fig, ax
+
+
+class ChamberMeshArtist:
+    """A 2D triangle mesh with one closed chamber loop filled and outlined
+    (pneumatic-actuation tutorial 015).
+
+    ``loop`` is the chamber wall as an ordered vertex loop (for an edge loop
+    ``E_chamber`` pass ``E_chamber[:, 0]``). ``rest`` (optional) draws the rest
+    shape as a flat light-gray silhouette underneath; ``pins`` (optional vertex
+    indices) are marked at their rest positions. ``update(U)`` moves the mesh
+    and the chamber.
+    """
+
+    def __init__(self, ax, U, T, loop, *, rest=None, pins=None, facecolor="#cfe8df",
+                 edgecolor="#2a7f62", chamber_color="#08519c", lw=0.5, wall_lw=2.0,
+                 pin_size=20, zorder=2):
+        from matplotlib.patches import Polygon as _Polygon
+        U = np.asarray(U, dtype=float)
+        self.loop = np.asarray(loop)
+        if rest is not None:
+            PolyMeshArtist(ax, rest, T, facecolor="0.88", edgecolor="none", lw=0,
+                           zorder=zorder - 1, alpha=1.0)
+        self.mesh = PolyMeshArtist(ax, U, T, facecolor=facecolor, edgecolor=edgecolor,
+                                   lw=lw, zorder=zorder)
+        self.chamber = _Polygon(U[self.loop], closed=True, facecolor=chamber_color,
+                                edgecolor="none", alpha=0.18, zorder=zorder + 1)
+        ax.add_patch(self.chamber)
+        closed = np.vstack([U[self.loop], U[self.loop[:1]]])
+        (self.wall,) = ax.plot(closed[:, 0], closed[:, 1], "-", color=chamber_color,
+                               lw=wall_lw, zorder=zorder + 2, label="chamber wall")
+        if pins is not None and len(np.atleast_1d(pins)):
+            P = np.asarray(rest if rest is not None else U, dtype=float)[np.atleast_1d(pins)]
+            ax.scatter(P[:, 0], P[:, 1], s=pin_size, marker="s", color=PIN_C,
+                       zorder=zorder + 3, label="pinned")
+
+    def update(self, U):
+        U = np.asarray(U, dtype=float)
+        self.mesh.update(U)
+        self.chamber.set_xy(U[self.loop])
+        closed = np.vstack([U[self.loop], U[self.loop[:1]]])
+        self.wall.set_data(closed[:, 0], closed[:, 1])
+
+
+def animate_chamber_trace(states, T, loop, xs, series, *, pins=None, lims=None, fps=20,
+                          title="", xlabel="", ylabel="", trace_title=None, colors=None,
+                          figsize=(12, 4.2)):
+    """Left: a mesh whose chamber inflates (:class:`ChamberMeshArtist`). Right:
+    curve(s) ``series`` over ``xs`` traced in lock-step (:class:`TracePlot`).
+    ``states[i]`` is frame ``i``; ``pins`` are marked at ``states[0]``.
+    Returns ``(fig, anim)``."""
+    if lims is None:
+        xlim, ylim = auto_limits(states, pad=0.25)
+    else:
+        xlim, ylim = lims
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=figsize,
+                                   gridspec_kw={"width_ratios": [2.4, 1]})
+    setup_axes(axL, xlim, ylim, title=title)
+    art = ChamberMeshArtist(axL, states[0], T, loop, pins=pins, lw=0.5)
+    trace = TracePlot(axR, xs, series, colors=colors, xlabel=xlabel, ylabel=ylabel,
+                      title=trace_title)
+    fig.tight_layout()
+
+    def update(i):
+        art.update(states[i])
+        trace.update(i)
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=len(states), interval=1000 / fps, blit=False)
+    return fig, anim
+
+
+def animate_chamber_panels(panels, *, lims=None, fps=20, suptitle=None, figsize=None, lw=0.25):
+    """Several chamber meshes deforming side by side, played in sync (tutorial 015).
+
+    ``panels`` is a list of dicts ``{"states": [...], "T": T, "loop": loop,
+    "title": str}`` with optional ``"pins"`` (vertex indices). Shorter panels
+    hold their last frame. Returns ``(fig, anim)``."""
+    npan = len(panels)
+    if lims is None:
+        xlim, ylim = auto_limits([s for p in panels for s in p["states"]], pad=0.1)
+    else:
+        xlim, ylim = lims
+    figsize = figsize or (4.5 * npan, 3.2)
+    fig, axes = plt.subplots(1, npan, figsize=figsize, squeeze=False)
+    arts = []
+    for ax, p in zip(axes[0], panels):
+        setup_axes(ax, xlim, ylim, title=p.get("title", ""))
+        arts.append(ChamberMeshArtist(ax, p["states"][0], p["T"], p["loop"],
+                                      pins=p.get("pins"), lw=lw, pin_size=10))
+    if suptitle:
+        fig.suptitle(suptitle)
+    fig.tight_layout()
+    nframes = max(len(p["states"]) for p in panels)
+
+    def update(i):
+        for art, p in zip(arts, panels):
+            art.update(p["states"][min(i, len(p["states"]) - 1)])
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=nframes, interval=1000 / fps, blit=False)
+    return fig, anim
+
+
+def plot_spring_network(ax, X, E, *, node_values=None, edge_values=None, pins=None,
+                        title=None, lims=None, cmap="viridis", vmin=None, vmax=None,
+                        colorbar=True, label=None, node_size=30, lw=2.0,
+                        edgecolor=SPRING_EDGE, node_color=SPRING_NODE):
+    """Static picture of a 2D mass-spring network / polyline (springs ``E`` between points ``X``).
+
+    Optionally colors the nodes by a per-node scalar ``node_values`` (NaN entries are drawn
+    gray, e.g. nodes where a per-hinge quantity is undefined) or the springs by a per-edge
+    scalar ``edge_values``, and marks pinned nodes (``pins``, vertex indices) with squares.
+    Returns the color mappable (``None`` when nothing is colored).
+    """
+    X = np.asarray(X, dtype=float)
+    E = np.asarray(E)
+    segs = [X[e] for e in E]
+    mappable = None
+    if edge_values is not None:
+        coll = LineCollection(segs, array=np.asarray(edge_values, float).ravel(), cmap=cmap,
+                              linewidths=lw * 1.6, zorder=2)
+        coll.set_clim(vmin, vmax)
+        mappable = coll
+    else:
+        coll = LineCollection(segs, colors=edgecolor, linewidths=lw, zorder=2)
+    ax.add_collection(coll)
+    if node_values is not None:
+        vals = np.asarray(node_values, dtype=float).ravel()
+        undefined = ~np.isfinite(vals)
+        if undefined.any():
+            ax.scatter(X[undefined, 0], X[undefined, 1], s=node_size, color="0.6", zorder=3)
+        mappable = ax.scatter(X[~undefined, 0], X[~undefined, 1], s=node_size, c=vals[~undefined],
+                              cmap=cmap, vmin=vmin, vmax=vmax, zorder=3, edgecolors="none")
+    elif node_size:
+        ax.scatter(X[:, 0], X[:, 1], s=node_size, color=node_color, zorder=3)
+    if pins is not None and len(np.atleast_1d(pins)):
+        P = X[np.atleast_1d(pins)]
+        ax.scatter(P[:, 0], P[:, 1], s=node_size * 1.8, marker="s", color=PIN_C, zorder=4,
+                   label="pinned")
+        ax.legend(loc="upper right", fontsize=8)
+    setup_axes(ax, *(lims if lims is not None else auto_limits([X], pad=0.2)), title=title)
+    if colorbar and mappable is not None:
+        ax.figure.colorbar(mappable, ax=ax, shrink=0.8, label=label)
+    return mappable
+
+
+def regular_polygon(n, r=1.0, center=(0.0, 0.0)):
+    """``n`` vertices at equal angles, counter-clockwise around ``center``; shape ``(n, 2)``.
+
+    ``r`` is one radius or a length-``n`` array of per-vertex radii (alternating
+    radii give a star). Unlike ``simkit.circle_outline`` the first vertex is not
+    repeated at the end, so every edge has nonzero length.
+    """
+    theta = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    r = np.broadcast_to(np.asarray(r, dtype=float), (n,))
+    return np.column_stack([center[0] + r * np.cos(theta),
+                            center[1] + r * np.sin(theta)])
+
+
+def draw_closed_outline(ax, X, E=None, *, color="#264653", fill=True, lw=2.5, ms=5,
+                        alpha=0.18, arrows=False, zorder=3):
+    """Draw a closed 2D outline (optionally filled), with its vertices as dots.
+
+    ``E`` is the loop's ordered edge list (default ``[[0, 1], ..., [n-1, 0]]``);
+    the loop is walked in the order ``E[:, 0]``. ``arrows=True`` puts an
+    arrowhead on every edge to show the winding direction. Returns the loop's
+    ``Line2D``.
+    """
+    X = np.asarray(X, dtype=float)
+    order = np.arange(len(X)) if E is None else np.asarray(E)[:, 0]
+    P = X[order]
+    if fill:
+        ax.fill(P[:, 0], P[:, 1], color=color, alpha=alpha, zorder=zorder - 2)
+    loop = np.vstack([P, P[:1]])
+    (line,) = ax.plot(loop[:, 0], loop[:, 1], "-o", color=color, lw=lw, ms=ms,
+                      zorder=zorder)
+    if arrows:
+        for a, b in zip(P, np.roll(P, -1, axis=0)):
+            mid, d = 0.5 * (a + b), b - a
+            ax.annotate("", xy=mid + 0.18 * d, xytext=mid - 0.18 * d,
+                        arrowprops=dict(arrowstyle="-|>", color=color, lw=2))
+    return line
+
+
+def animate_outline_trace(states, xs, series, *, E=None, rest=None, color="#2a9d8f",
+                          colors=None, dashed=(), logy=False, lims=None, fps=20,
+                          xlabel="", ylabel="", title=None, scene_title="",
+                          figsize=(11, 5), interval=None):
+    """Left: a closed 2D outline moving through ``states``; right: curves traced in lock-step.
+
+    The outline is filled, with small vertex dots; ``rest`` (if given) is ghosted
+    as a dashed gray loop on top. ``E`` is the loop's ordered edge list (default
+    ``[[0, 1], ..., [n-1, 0]]``). ``series`` maps a label to one value per frame
+    (plotted over ``xs``); labels listed in ``dashed`` are drawn dashed.
+    Returns ``(fig, anim)``.
+    """
+    order = np.arange(len(states[0])) if E is None else np.asarray(E)[:, 0]
+    if lims is None:
+        xlim, ylim = auto_limits(list(states) + ([rest] if rest is not None else []))
+    else:
+        xlim, ylim = lims
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=figsize)
+    setup_axes(axL, xlim, ylim, title=scene_title)
+    P0 = np.asarray(states[0], dtype=float)[order]
+    fill = Polygon(P0, closed=True, facecolor=color, edgecolor="none", alpha=0.18, zorder=1)
+    axL.add_patch(fill)
+    (loop,) = axL.plot([], [], "-o", color=color, lw=2.5, ms=4, zorder=3)
+    if rest is not None:
+        R = np.asarray(rest, dtype=float)[order]
+        R = np.vstack([R, R[:1]])
+        axL.plot(R[:, 0], R[:, 1], "--", color="0.35", lw=1.2, zorder=4, label="start")
+        axL.legend(loc="upper right", fontsize=9)
+    trace = TracePlot(axR, xs, series, colors=colors, xlabel=xlabel, ylabel=ylabel,
+                      logy=logy, title=title)
+    for name in dashed:
+        trace.lines[name].set_linestyle("--")
+    if len(series) > 1:
+        axR.legend(loc="best", fontsize=9)   # rebuild so the legend shows the dashes
+
+    def update(i):
+        P = np.asarray(states[i], dtype=float)[order]
+        fill.set_xy(P)
+        L = np.vstack([P, P[:1]])
+        loop.set_data(L[:, 0], L[:, 1])
+        trace.update(i)
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=len(states),
+                         interval=interval or 1000 / fps, blit=False)
+    return fig, anim
+
+
+def best_time(fn, inner=1, rep=7):
+    """Wall-clock seconds of one ``fn()`` call: the minimum over ``rep`` batches of
+    ``inner`` back-to-back calls, divided by ``inner``.
+
+    Taking the minimum filters out scheduler noise, and batching several calls
+    makes sub-millisecond timings (small dense solves) meaningful.
+    """
+    import time
+    best = float("inf")
+    for _ in range(rep):
+        t0 = time.perf_counter()
+        for _ in range(inner):
+            fn()
+        best = min(best, (time.perf_counter() - t0) / inner)
+    return best
+
+
+class TendonMeshArtist:
+    """A 2D triangle mesh with actuator edges (tendons) drawn on top as thick
+    colored segments with dotted endpoints (mass-spring actuation tutorial 016).
+
+    ``E_act`` is an ``(m, 2)`` array of actuator edges; ``colors`` and ``labels``
+    give one entry per edge. ``rest`` (optional) ghosts the rest mesh as light-gray
+    outlines underneath; ``pins`` (optional vertex indices) are marked at their
+    rest positions (``rest`` if given, else ``U``). ``update(U)`` moves the mesh
+    and the tendons.
+    """
+
+    def __init__(self, ax, U, T, E_act, *, colors=None, labels=None, rest=None, pins=None,
+                 facecolor="#cfe8df", edgecolor="#2a7f62", node_color="#e6550d", lw=0.6,
+                 tendon_lw=3.0, node_size=6, pin_size=30, zorder=2):
+        U = np.asarray(U, dtype=float)
+        self.E_act = np.asarray(E_act)
+        m = len(self.E_act)
+        colors = colors or ["#c0392b"] * m
+        labels = labels or [None] * m
+        if rest is not None:
+            PolyMeshArtist(ax, rest, T, facecolor="none", edgecolor="0.8", lw=0.5,
+                           zorder=zorder - 1, alpha=1.0)
+        self.mesh = PolyMeshArtist(ax, U, T, facecolor=facecolor, edgecolor=edgecolor,
+                                   lw=lw, zorder=zorder)
+        self.lines = []
+        for (i, j), c, lbl in zip(self.E_act, colors, labels):
+            (ln,) = ax.plot(U[[i, j], 0], U[[i, j], 1], "-", color=c, lw=tendon_lw,
+                            zorder=zorder + 2, label=lbl)
+            self.lines.append(ln)
+        ends = self.E_act.ravel()
+        (self.nodes,) = ax.plot(U[ends, 0], U[ends, 1], "o", color=node_color, ms=node_size,
+                                zorder=zorder + 3)
+        if pins is not None and len(np.atleast_1d(pins)):
+            P = np.asarray(rest if rest is not None else U, dtype=float)[np.atleast_1d(pins)]
+            ax.scatter(P[:, 0], P[:, 1], s=pin_size, marker="s", color=PIN_C,
+                       zorder=zorder + 4, label="pinned")
+
+    def update(self, U):
+        U = np.asarray(U, dtype=float)
+        self.mesh.update(U)
+        for ln, (i, j) in zip(self.lines, self.E_act):
+            ln.set_data(U[[i, j], 0], U[[i, j], 1])
+        ends = self.E_act.ravel()
+        self.nodes.set_data(U[ends, 0], U[ends, 1])
+
+
+def animate_tendon_trace(states, T, E_act, xs, series, *, tendon_colors=None, pins=None,
+                         lims=None, fps=20, title="", xlabel="", ylabel="", trace_title=None,
+                         trace_colors=None, figsize=(12, 4.2)):
+    """Left: a mesh bending under its tendons (:class:`TendonMeshArtist`). Right:
+    curve(s) ``series`` over ``xs`` traced in lock-step (:class:`TracePlot`), with a
+    gray zero line. ``states[i]`` is frame ``i``; ``pins`` are marked at
+    ``states[0]``. Returns ``(fig, anim)``."""
+    if lims is None:
+        xlim, ylim = auto_limits(states, pad=0.25)
+    else:
+        xlim, ylim = lims
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=figsize,
+                                   gridspec_kw={"width_ratios": [2.4, 1]})
+    setup_axes(axL, xlim, ylim, title=title)
+    art = TendonMeshArtist(axL, states[0], T, E_act, colors=tendon_colors, pins=pins)
+    trace = TracePlot(axR, xs, series, colors=trace_colors, xlabel=xlabel, ylabel=ylabel,
+                      title=trace_title)
+    axR.axhline(0, color="0.6", lw=1.0, zorder=1)
+    fig.tight_layout()
+
+    def update(i):
+        art.update(states[i])
+        trace.update(i)
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=len(states), interval=1000 / fps, blit=False)
+    return fig, anim
+
+
+def animate_tendon_panels(panels, *, lims=None, fps=20, suptitle=None, figsize=None,
+                          tendon_colors=None):
+    """Several tendon-driven meshes deforming side by side, played in sync
+    (tutorial 016).
+
+    ``panels`` is a list of dicts ``{"states": [...], "T": T, "E_act": E_act,
+    "title": str}`` with optional ``"pins"`` (vertex indices). Shorter panels
+    hold their last frame. Returns ``(fig, anim)``."""
+    npan = len(panels)
+    if lims is None:
+        xlim, ylim = auto_limits([s for p in panels for s in p["states"]], pad=0.15)
+    else:
+        xlim, ylim = lims
+    figsize = figsize or (4.6 * npan, 4.0)
+    fig, axes = plt.subplots(1, npan, figsize=figsize, squeeze=False)
+    arts = []
+    for ax, p in zip(axes[0], panels):
+        setup_axes(ax, xlim, ylim, title=p.get("title", ""))
+        arts.append(TendonMeshArtist(ax, p["states"][0], p["T"], p["E_act"],
+                                     colors=tendon_colors, pins=p.get("pins"),
+                                     lw=0.5, tendon_lw=2.6, node_size=5, pin_size=20))
+    if suptitle:
+        fig.suptitle(suptitle)
+    fig.tight_layout()
+    nframes = max(len(p["states"]) for p in panels)
+
+    def update(i):
+        for art, p in zip(arts, panels):
+            art.update(p["states"][min(i, len(p["states"]) - 1)])
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=nframes, interval=1000 / fps, blit=False)
+    return fig, anim
+
+
+def animate_mesh_arrows(states, T, arrow_base, arrow_vecs, *, lims=None, fps=20, title="",
+                        facecolor=MESH_FACE, edgecolor=None, lw=0.3, arrow_color=HANDLE_C,
+                        arrow_width=0.005, figsize=(6.5, 5.5), axis_off=True, interval=None):
+    """A deforming triangle mesh plus a set of arrows that change every frame.
+
+    ``states[i]`` is the mesh at frame ``i`` and ``arrow_vecs[i]`` the ``(k, 2)``
+    arrows drawn at the fixed base points ``arrow_base`` ``(k, 2)``, in data units.
+    ``edgecolor=None`` draws edges in the face color, so a fine mesh reads as a
+    smooth shape. Returns ``(fig, anim)``.
+    """
+    xlim, ylim = lims if lims is not None else auto_limits(states, pad=0.12)
+    fig, ax = plt.subplots(figsize=figsize)
+    setup_axes(ax, xlim, ylim, title=title, grid=not axis_off)
+    if axis_off:
+        ax.axis("off")
+    mesh = PolyMeshArtist(ax, states[0], T, facecolor=facecolor,
+                          edgecolor=facecolor if edgecolor is None else edgecolor, lw=lw)
+    base = np.asarray(arrow_base, dtype=float)
+    v0 = np.asarray(arrow_vecs[0], dtype=float)
+    quiv = ax.quiver(base[:, 0], base[:, 1], v0[:, 0], v0[:, 1], angles="xy",
+                     scale_units="xy", scale=1, color=arrow_color, width=arrow_width, zorder=5)
+
+    def update(i):
+        mesh.update(states[i])
+        v = np.asarray(arrow_vecs[i], dtype=float)
+        quiv.set_UVC(v[:, 0], v[:, 1])
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=len(states),
+                         interval=interval or 1000 / fps, blit=False)
+    return fig, anim
+
+
+def animate_triangle_blend(V, corner_vecs, points, point_vecs, texts, *, fps=20,
+                           figsize=(6.6, 6.0), corner_labels=None, facecolor=TRI_FACE,
+                           edgecolor=TRI_EDGE, corner_color=PIN_C, point_color=HANDLE_C,
+                           interval=None):
+    """One triangle with a fixed arrow at each corner and a moving point with its own arrow.
+
+    ``V`` is the ``(3, 2)`` triangle and ``corner_vecs`` its ``(3, 2)`` corner arrows.
+    ``points[i]`` / ``point_vecs[i]`` are the moving point and its arrow at frame
+    ``i``, and ``texts[i]`` is a caption shown above the triangle (for example the
+    point's barycentric weights). Returns ``(fig, anim)``.
+    """
+    V = np.asarray(V, dtype=float)
+    corner_vecs = np.asarray(corner_vecs, dtype=float)
+    points = np.asarray(points, dtype=float)
+    point_vecs = np.asarray(point_vecs, dtype=float)
+    corner_labels = corner_labels or [rf"$u_{i}$" for i in range(3)]
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.add_patch(Polygon(V, closed=True, facecolor=facecolor, edgecolor=edgecolor,
+                         lw=2.5, alpha=0.55, zorder=1))
+    for i in range(3):
+        ax.quiver(V[i, 0], V[i, 1], corner_vecs[i, 0], corner_vecs[i, 1], angles="xy",
+                  scale_units="xy", scale=1, color=corner_color, width=0.012, zorder=4)
+        ax.scatter(*V[i], s=90, color=edgecolor, zorder=5)
+        ax.annotate(corner_labels[i], V[i] + np.array([0.04, 0.04]), fontsize=13,
+                    color=corner_color)
+    xlim, ylim = auto_limits([V, V + corner_vecs, points + point_vecs], pad=0.2)
+    setup_axes(ax, xlim, ylim, grid=False)
+    ax.axis("off")
+    quiv = ax.quiver(points[0, 0], points[0, 1], point_vecs[0, 0], point_vecs[0, 1],
+                     angles="xy", scale_units="xy", scale=1, color=point_color,
+                     width=0.015, zorder=7)
+    (dot,) = ax.plot([points[0, 0]], [points[0, 1]], "o", color=point_color, ms=9, zorder=8)
+    txt = ax.text(0.02, 1.02, texts[0], transform=ax.transAxes, va="bottom",
+                  family="monospace", fontsize=11,
+                  bbox=dict(boxstyle="round", fc="white", ec="0.6", alpha=0.9))
+
+    def update(i):
+        quiv.set_offsets(points[i])
+        quiv.set_UVC(point_vecs[i, 0], point_vecs[i, 1])
+        dot.set_data([points[i, 0]], [points[i, 1]])
+        txt.set_text(texts[i])
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=len(points),
+                         interval=interval or 1000 / fps, blit=False)
+    return fig, anim
+
+
+def animate_fields_trace(panels, T, xs, series, *, lims=None, cmap="viridis", norm=None,
+                         vmin=None, vmax=None, cbar_label=None, pin_pts=None, colors=None,
+                         xlabel="", ylabel="", title=None, ref_line=None, pose=None,
+                         fps=20, figsize=None, interval=None):
+    """Deforming meshes colored by a per-element scalar field, plus a lock-step trace.
+
+    ``panels`` is a list of dicts ``{"states": [...], "fields": [...], "title": str}``:
+    ``states[i]`` is the deformed mesh at frame ``i`` and ``fields[i]`` its per-element
+    values, drawn with :func:`plot_scalar_field` (one colorbar, on the last mesh panel).
+    The right-most axes traces ``series`` over ``xs`` with :class:`TracePlot`, with an
+    optional dashed horizontal ``ref_line``. ``pin_pts`` (k, 2) are drawn as blue squares.
+    ``pose`` shows that frame right away, so a still can be saved with ``save_figure``
+    before the animation is written. Returns ``(fig, anim)``.
+    """
+    if lims is None:
+        lims = auto_limits([s for p in panels for s in p["states"]], pad=0.2)
+    npan = len(panels)
+    figsize = figsize or (5.2 * npan + 5.0, 4.4)
+    fig, axes = plt.subplots(1, npan + 1, figsize=figsize,
+                             gridspec_kw={"width_ratios": [1.0] * npan + [0.95]})
+    colls = []
+    for k, (ax, p) in enumerate(zip(axes[:-1], panels)):
+        m = plot_scalar_field(ax, p["states"][0], T, p["fields"][0], title=p.get("title"),
+                              cmap=cmap, lims=lims, vmin=vmin, vmax=vmax, norm=norm,
+                              edges=False, colorbar=(k == npan - 1), label=cbar_label)
+        m.set_edgecolor("0.25")
+        m.set_linewidth(0.3)
+        if pin_pts is not None and len(pin_pts):
+            P = np.asarray(pin_pts)
+            ax.scatter(P[:, 0], P[:, 1], s=26, color=PIN_C, marker="s", zorder=4)
+        colls.append(m)
+    trace = TracePlot(axes[-1], xs, series, colors=colors, xlabel=xlabel, ylabel=ylabel,
+                      title=title)
+    if ref_line is not None:
+        axes[-1].axhline(ref_line, color="0.5", ls="--", lw=1.2, zorder=1)
+    Tn = np.asarray(T)
+
+    def update(i):
+        for m, p in zip(colls, panels):
+            m.set_verts([np.asarray(p["states"][i])[f] for f in Tn])
+            m.set_array(np.asarray(p["fields"][i]).ravel())
+        trace.update(i)
+        return ()
+
+    fig.tight_layout()
+    if pose is not None:
+        update(int(pose))
+    anim = FuncAnimation(fig, update, frames=len(panels[0]["states"]),
+                         interval=interval or 1000 / fps, blit=False)
+    return fig, anim
+
+
+def animate_meshes_trace(panels, xs, series, *, lims=None, colors=None, xlabel="", ylabel="",
+                         trace_title=None, logy=False, fps=20, figsize=None, suptitle=None,
+                         interval=None):
+    """Mesh panels played in sync with a progressively traced curve panel on the right.
+
+    ``panels`` is a list of dicts ``{"states": [...], "T": T, "title": str}`` with optional
+    ``"ghost"`` (per-frame reference states drawn filled in light gray underneath, e.g. a
+    target pose), ``"color"`` (draw the mesh as unfilled edges of this color), ``"label"``
+    and ``"ghost_label"`` (legend entries). ``series`` maps a label to a y-array over
+    ``xs`` (one sample per frame, see :class:`TracePlot`). Returns ``(fig, anim)``; the
+    animation also gets a ``set_frame(i)`` method that poses the figure at frame ``i``
+    (for saving a still with ``save_figure`` after the video).
+    """
+    npan = len(panels)
+    if lims is None:
+        allstates = [s for p in panels for key in ("states", "ghost") for s in p.get(key, [])]
+        xlim, ylim = auto_limits(allstates)
+    else:
+        xlim, ylim = lims
+    figsize = figsize or (4.8 * (npan + 1), 4.4)
+    fig, axes = plt.subplots(1, npan + 1, figsize=figsize,
+                             gridspec_kw={"width_ratios": [1] * npan + [1.15]})
+    arts = []
+    for ax, p in zip(axes[:-1], panels):
+        setup_axes(ax, xlim, ylim, title=p.get("title", ""))
+        ghost = None
+        if p.get("ghost") is not None:
+            ghost = PolyMeshArtist(ax, p["ghost"][0], p["T"], facecolor="0.9", edgecolor="0.65", lw=0.4)
+            ax.plot([], [], color="0.65", lw=2, label=p.get("ghost_label", "reference"))
+        c = p.get("color")
+        if c is None:
+            mesh = PolyMeshArtist(ax, p["states"][0], p["T"])
+        else:
+            mesh = PolyMeshArtist(ax, p["states"][0], p["T"], facecolor="none", edgecolor=c, lw=1.0)
+        if p.get("label"):
+            ax.plot([], [], color=c or MESH_EDGE, lw=2, label=p["label"])
+            ax.legend(loc="upper right", fontsize=8)
+        arts.append((mesh, ghost, p))
+    trace = TracePlot(axes[-1], xs, series, colors=colors, xlabel=xlabel, ylabel=ylabel,
+                      logy=logy, title=trace_title)
+
+    def update(i):
+        for mesh, ghost, p in arts:
+            mesh.update(p["states"][min(i, len(p["states"]) - 1)])
+            if ghost is not None:
+                ghost.update(p["ghost"][min(i, len(p["ghost"]) - 1)])
+        trace.update(i)
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=len(xs), interval=interval or 1000 / fps, blit=False)
+    anim.set_frame = update
+    if suptitle:
+        fig.suptitle(suptitle)
+    return fig, anim
+
+
+def animate_mode_shapes(X, T, B, *, titles=None, n_frames=36, amp=0.3, fps=20,
+                        suptitle=None, figsize=None, pad=0.08, interval=None):
+    """Play every column of a modal basis on its rest mesh, one panel per mode.
+
+    ``B`` is ``(n*dim, k)`` with vertex-stacked columns. Mode ``j`` is shown as
+    ``X + a_j sin(2 pi t) u_j`` over one period of ``n_frames`` frames, with
+    ``a_j`` chosen so its largest vertex displacement is ``amp`` (mass-normalized
+    modes otherwise differ wildly in size). Panels are stacked vertically and
+    played in sync, over a light-gray ghost of the rest shape so frozen regions
+    (which hide the ghost) and moving ones stand apart. Returns ``(fig, anim)``.
+    """
+    X = np.asarray(X, dtype=float)
+    n, dim = X.shape
+    k = B.shape[1]
+    titles = titles or [f"mode {j + 1}" for j in range(k)]
+    phases = np.sin(2.0 * np.pi * np.arange(n_frames) / n_frames)
+    disps = []
+    for j in range(k):
+        d = np.asarray(B[:, j], dtype=float).reshape(n, dim)
+        disps.append(d * (amp / (np.linalg.norm(d, axis=1).max() + 1e-12)))
+    xlim, ylim = auto_limits([X + d for d in disps] + [X - d for d in disps], pad=pad)
+    aspect = (ylim[1] - ylim[0]) / (xlim[1] - xlim[0])
+    figsize = figsize or (7.0, k * (6.6 * aspect + 0.35) + (0.5 if suptitle else 0.1))
+    fig, axes = plt.subplots(k, 1, figsize=figsize, squeeze=False)
+    arts = []
+    for ax, d, title in zip(axes[:, 0], disps, titles):
+        setup_axes(ax, xlim, ylim, grid=False)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(title, fontsize=10, loc="left")
+        ax.add_collection(PolyCollection([X[f] for f in T], facecolors="0.88",
+                                         edgecolors="none", zorder=1))
+        arts.append(PolyMeshArtist(ax, X, T, lw=0.4, zorder=2))
+    if suptitle:
+        fig.suptitle(suptitle)
+    fig.tight_layout()
+
+    def update(i):
+        for art, d in zip(arts, disps):
+            art.update(X + phases[i] * d)
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=n_frames,
+                         interval=interval or 1000 / fps, blit=False)
+    return fig, anim
+
+
+def animate_mesh_labeled(states, T, labels, *, rest=None, pin_pts=None, lims=None, fps=20,
+                         title="", lw=0.1, facecolor=MESH_FACE, edgecolor=MESH_EDGE,
+                         pin_size=10, figsize=(6.5, 5.5), interval=None):
+    """A deforming 2D triangle mesh with a per-frame caption (e.g. solver iterations).
+
+    ``states[i]`` is the mesh at frame ``i`` and ``labels[i]`` its caption, shown in a
+    monospace box in the upper-left corner. ``rest`` (optional) is ghosted in light gray
+    underneath, and ``pin_pts`` (optional ``(k, 2)`` array) are drawn as small squares.
+    Thin edges (``lw``) keep a fine mesh readable. Returns ``(fig, anim)``.
+    """
+    xlim, ylim = lims if lims is not None else auto_limits(states, pad=0.3)
+    fig, ax = plt.subplots(figsize=figsize)
+    setup_axes(ax, xlim, ylim, title=title)
+    if rest is not None:
+        PolyMeshArtist(ax, rest, T, facecolor="#efefef", edgecolor="#d9d9d9", lw=lw, zorder=1)
+    mesh = PolyMeshArtist(ax, states[0], T, facecolor=facecolor, edgecolor=edgecolor, lw=lw)
+    if pin_pts is not None and len(pin_pts):
+        P = np.asarray(pin_pts, dtype=float)
+        ax.scatter(P[:, 0], P[:, 1], s=pin_size, marker="s", color=PIN_C, zorder=5,
+                   label="clamped")
+        ax.legend(loc="upper right", fontsize=9)
+    txt = text_box(ax, labels[0], loc="upper left")
+    fig.tight_layout()
+
+    def update(i):
+        mesh.update(states[i])
+        txt.set_text(labels[i])
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=len(states),
+                         interval=interval or 1000 / fps, blit=False)
+    return fig, anim
