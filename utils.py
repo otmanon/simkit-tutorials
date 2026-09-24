@@ -1516,3 +1516,325 @@ def animate_mesh_labeled(states, T, labels, *, rest=None, pin_pts=None, lims=Non
     anim = FuncAnimation(fig, update, frames=len(states),
                          interval=interval or 1000 / fps, blit=False)
     return fig, anim
+
+
+def animate_colored_mesh_panels(panels, *, lims=None, fps=20, ncols=None, figsize=None,
+                                suptitle=None, edgecolor="0.25", lw=0.3, pad=0.3,
+                                interval=None):
+    """Deforming meshes in a grid of panels, each filled with its own color, played in sync.
+
+    ``panels`` is a list of dicts ``{"states": [...], "T": T, "title": str, "color": c}``
+    with optional ``"ghost"`` (per-frame reference states drawn in light gray underneath,
+    e.g. the rig pose under a simulated result) and ``"handle"`` (per-frame ``(2,)`` or
+    ``(k, 2)`` handle positions drawn as orange dots). ``ncols`` defaults to one row.
+    Shorter panels hold their last frame. Returns ``(fig, anim)``.
+    """
+    npan = len(panels)
+    ncols = ncols or npan
+    nrows = int(np.ceil(npan / ncols))
+    if lims is None:
+        allstates = [s for p in panels for key in ("states", "ghost") for s in p.get(key, [])]
+        xlim, ylim = auto_limits(allstates, pad=pad)
+    else:
+        xlim, ylim = lims
+    aspect = (ylim[1] - ylim[0]) / (xlim[1] - xlim[0])
+    w = 12.0 / ncols if ncols > 1 else 10.0
+    figsize = figsize or (w * ncols, nrows * (w * aspect + 0.55) + (0.45 if suptitle else 0.0))
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+    arts = []
+    for k, ax in enumerate(axes.flat):
+        if k >= npan:
+            ax.axis("off")
+            continue
+        p = panels[k]
+        setup_axes(ax, xlim, ylim, title=p.get("title", ""))
+        ghost = None
+        if p.get("ghost") is not None:
+            ghost = PolyMeshArtist(ax, p["ghost"][0], p["T"], facecolor="0.85",
+                                   edgecolor="none", lw=0, zorder=1, alpha=1.0)
+        mesh = PolyMeshArtist(ax, p["states"][0], p["T"], facecolor=p.get("color", MESH_FACE),
+                              edgecolor=edgecolor, lw=lw, zorder=2, alpha=0.95)
+        hdl = None
+        if p.get("handle") is not None:
+            (hdl,) = ax.plot([], [], "o", color=HANDLE_C, ms=8, mec="k", mew=0.8, zorder=5)
+        arts.append((mesh, ghost, hdl, p))
+    if suptitle:
+        fig.suptitle(suptitle)
+    fig.tight_layout()
+
+    def update(i):
+        for mesh, ghost, hdl, p in arts:
+            mesh.update(p["states"][min(i, len(p["states"]) - 1)])
+            if ghost is not None:
+                ghost.update(p["ghost"][min(i, len(p["ghost"]) - 1)])
+            if hdl is not None:
+                h = np.atleast_2d(p["handle"][min(i, len(p["handle"]) - 1)])
+                hdl.set_data(h[:, 0], h[:, 1])
+        return ()
+
+    update(0)
+    nframes = max(len(p["states"]) for p in panels)
+    anim = FuncAnimation(fig, update, frames=nframes, interval=interval or 1000 / fps, blit=False)
+    return fig, anim
+
+
+def plot_mesh_overlay(ax, meshes, T, *, colors=None, lws=None, pin_pts=None, lims=None,
+                      title=None, legend=True):
+    """Draw several deformed copies of one 2D triangle mesh on top of each other, edges only.
+
+    ``meshes`` maps a label to an ``(n, 2)`` vertex array (e.g. two solvers' results at
+    the same time); later labels are drawn on top. ``colors`` / ``lws`` map a label to
+    its edge color / line width, so a thick light copy under a thin dark one shows where
+    they agree. ``pin_pts`` (optional ``(k, 2)``) are drawn as blue squares. Returns a
+    dict ``label -> PolyMeshArtist`` (call ``.update(U)`` to move one).
+    """
+    colors = colors or {}
+    lws = lws or {}
+    arts = {}
+    for k, (name, U) in enumerate(meshes.items()):
+        c = colors.get(name, f"C{k}")
+        arts[name] = PolyMeshArtist(ax, U, T, facecolor="none", edgecolor=c,
+                                    lw=lws.get(name, 0.6), zorder=2 + k, alpha=1.0)
+        ax.plot([], [], color=c, lw=2, label=name)
+    if pin_pts is not None and len(pin_pts):
+        P = np.asarray(pin_pts, dtype=float)
+        ax.scatter(P[:, 0], P[:, 1], s=18, marker="s", color=PIN_C, zorder=10, label="pinned")
+    xlim, ylim = lims if lims is not None else auto_limits(list(meshes.values()), pad=0.1)
+    setup_axes(ax, xlim, ylim, title=title)
+    if legend:
+        ax.legend(loc="upper right", fontsize=8)
+    return arts
+
+
+def animate_mesh_overlay(runs, T, *, colors=None, lws=None, pin_pts=None, lims=None,
+                         titles=None, fps=20, figsize=(6.5, 5.5), interval=None):
+    """Several simulations of the same 2D mesh played on top of each other (edges only).
+
+    ``runs`` maps a label to a list of ``(n, 2)`` frames (all the same length); styling
+    as in :func:`plot_mesh_overlay`. ``titles[i]`` (optional) is the axes title of frame
+    ``i``. Returns ``(fig, anim)``.
+    """
+    names = list(runs)
+    nframes = len(runs[names[0]])
+    if lims is None:
+        lims = auto_limits([s for r in runs.values() for s in r], pad=0.1)
+    fig, ax = plt.subplots(figsize=figsize)
+    arts = plot_mesh_overlay(ax, {k: runs[k][0] for k in names}, T, colors=colors, lws=lws,
+                             pin_pts=pin_pts, lims=lims, title=titles[0] if titles else None)
+    fig.tight_layout()
+
+    def update(i):
+        for k in names:
+            arts[k].update(runs[k][i])
+        if titles:
+            ax.set_title(titles[i])
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=nframes, interval=interval or 1000 / fps, blit=False)
+    return fig, anim
+
+
+def animate_mesh_above_trace(states, T, xs, series, *, markers=None, floor_y=None, lims=None,
+                             fps=20, scene_title="", xlabel="", ylabel="", trace_title=None,
+                             colors=None, figsize=(10, 6), height_ratios=(1.3, 1.0), lw=0.3,
+                             mesh_face=MESH_FACE, mesh_edge=MESH_EDGE, marker_color="#d62728"):
+    """Top: a deforming 2D mesh, optionally over a floor and with moving marker points.
+    Bottom: curve(s) ``series`` over ``xs`` traced in lock-step (:class:`TracePlot`).
+
+    Stacking the two panels suits scenes much wider than tall, such as a mesh that
+    travels across the floor (modal-muscle tutorial 025). ``markers[i]`` (optional)
+    is a ``(2,)`` point or a ``(k, 2)`` array drawn at frame ``i``, for example the
+    center of mass. ``floor_y`` draws a gray ground below that height. ``lw`` is the
+    mesh edge width. Returns ``(fig, anim)``.
+    """
+    if lims is None:
+        xlim, ylim = auto_limits(states, pad=0.15)
+        if floor_y is not None:
+            ylim = (min(ylim[0], floor_y - 0.15), ylim[1])
+    else:
+        xlim, ylim = lims
+    fig, (axT, axB) = plt.subplots(2, 1, figsize=figsize,
+                                   gridspec_kw={"height_ratios": list(height_ratios)})
+    setup_axes(axT, xlim, ylim, title=scene_title)
+    if floor_y is not None:
+        _draw_floor(axT, floor_y, xlim, ylim)
+    mesh = PolyMeshArtist(axT, states[0], T, facecolor=mesh_face, edgecolor=mesh_edge,
+                          lw=lw, zorder=3)
+    mk = None
+    if markers is not None:
+        (mk,) = axT.plot([], [], "o", color=marker_color, ms=7, zorder=5)
+    trace = TracePlot(axB, xs, series, colors=colors, xlabel=xlabel, ylabel=ylabel,
+                      title=trace_title)
+    fig.tight_layout()
+
+    def update(i):
+        mesh.update(states[i])
+        if mk is not None:
+            p = np.atleast_2d(markers[i])
+            mk.set_data(p[:, 0], p[:, 1])
+        trace.update(i)
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=len(states), interval=1000 / fps, blit=False)
+    return fig, anim
+
+
+def auto_limits_3d(states, pad=0.1):
+    """Padded ``(xlim, ylim, zlim)`` bounding box over every ``(n, 3)`` state in ``states``."""
+    allpts = np.concatenate([np.asarray(s, dtype=float).reshape(-1, 3) for s in states], axis=0)
+    lo = allpts.min(axis=0) - pad
+    hi = allpts.max(axis=0) + pad
+    return tuple((float(a), float(b)) for a, b in zip(lo, hi))
+
+
+def to_display_y_up(P):
+    """Reorder 3D points ``(..., 3)`` from data ``(x, y, z)`` to Matplotlib's
+    ``(x, z, y)`` so that data ``y`` is drawn vertically. Every ``*_y_up`` helper
+    uses it; :func:`setup_axes_y_up` reverses the data-``z`` axis so the picture
+    stays right-handed (a rotation, not a mirror image)."""
+    return np.asarray(P, dtype=float)[..., [0, 2, 1]]
+
+
+def setup_axes_y_up(ax, lims, *, title=None, elev=18, azim=-60, fontsize=11):
+    """3D scene axis, true to scale, with data ``y`` pointing up on screen (so a
+    ``-y`` gravity points down). ``lims = (xlim, ylim, zlim)`` in data order.
+    Short axes get fewer ticks, and very thin ones none, so labels do not overlap.
+    Artists are drawn in the order they were added (a rest-shape ghost added first
+    stays behind). The 3D box always fits a square area, so view a long, thin
+    object obliquely to fill it. Pair with :func:`surface_y_up` /
+    :func:`scatter_y_up`. Returns ``ax``."""
+    from matplotlib.ticker import MaxNLocator, NullLocator
+    (x0, x1), (y0, y1), (z0, z1) = lims
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(z1, z0)                      # data z, reversed -> right-handed picture
+    ax.set_zlim(y0, y1)                      # data y, vertical
+    ext = np.array([x1 - x0, z1 - z0, y1 - y0])
+    ax.set_box_aspect(tuple(ext))
+    for axis, e in zip((ax.xaxis, ax.yaxis, ax.zaxis), ext):
+        if e < 0.2 * ext.max():
+            axis.set_major_locator(NullLocator())
+        else:
+            axis.set_major_locator(MaxNLocator(nbins=int(np.clip(round(7 * e / ext.max()), 2, 7))))
+    ax.computed_zorder = False
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_xlabel("x")
+    ax.set_ylabel("z")
+    ax.set_zlabel("y", labelpad=-3)          # default pad pushes it outside a tight crop
+    if title is not None:
+        ax.set_title(title, fontsize=fontsize)
+    return ax
+
+
+def surface_y_up(ax, polys, *, values=None, facecolor=MESH_FACE, edgecolor=MESH_EDGE,
+                 lw=0.3, alpha=0.95, cmap="viridis", norm=None, vmin=None, vmax=None,
+                 colorbar=False, label=None):
+    """Add triangles ``polys`` (``(k, 3, 3)`` corner positions in data ``(x, y, z)``)
+    to a :func:`setup_axes_y_up` axis as one ``Poly3DCollection``. With ``values``
+    (one per triangle) the faces are colored by that scalar field through ``cmap``
+    and ``norm`` (or ``vmin`` / ``vmax``); ``colorbar=True`` adds a colorbar
+    labelled ``label``. ``coll.set_verts(to_display_y_up(new_polys))`` moves it.
+    Returns the collection."""
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    from matplotlib import colors as mcolors, cm
+    if values is not None:
+        values = np.asarray(values, dtype=float).ravel()
+        if norm is None:
+            norm = mcolors.Normalize(vmin=values.min() if vmin is None else vmin,
+                                     vmax=values.max() if vmax is None else vmax)
+        facecolor = plt.get_cmap(cmap)(norm(values))
+    coll = Poly3DCollection(to_display_y_up(polys), facecolor=facecolor, edgecolor=edgecolor,
+                            linewidths=lw, alpha=alpha)
+    ax.add_collection3d(coll)
+    if values is not None and colorbar:
+        ax.figure.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, shrink=0.7,
+                           pad=0.1, label=label)
+    return coll
+
+
+def scatter_y_up(ax, P, **kwargs):
+    """``ax.scatter`` of 3D points ``P`` (``(n, 3)`` data ``(x, y, z)``) on a
+    :func:`setup_axes_y_up` axis; depth shading is off by default."""
+    D = to_display_y_up(np.atleast_2d(P))
+    kwargs.setdefault("depthshade", False)
+    return ax.scatter(D[:, 0], D[:, 1], D[:, 2], **kwargs)
+
+
+def plot_mesh_y_up(ax, X, F, *, pins=None, handles=None, title=None, lims=None,
+                   facecolor=MESH_FACE, edgecolor=MESH_EDGE, lw=0.5, alpha=0.3,
+                   show_vertices=True, elev=18, azim=-60):
+    """3D counterpart of :func:`plot_mesh` (y drawn up): the surface triangles
+    ``F`` of ``X`` (``(n, 3)``) with their edges, the vertices, and pinned / handle
+    vertex indices as blue squares / orange dots. Returns the surface collection."""
+    X = np.asarray(X, dtype=float)
+    coll = surface_y_up(ax, X[np.asarray(F)], facecolor=facecolor, edgecolor=edgecolor,
+                        lw=lw, alpha=alpha)
+    if show_vertices:
+        scatter_y_up(ax, X, s=6, color=edgecolor, label="vertices")
+    if pins is not None and len(np.atleast_1d(pins)):
+        scatter_y_up(ax, X[np.atleast_1d(pins)], s=30, marker="s", color=PIN_C, label="pinned")
+    if handles is not None and len(np.atleast_1d(handles)):
+        scatter_y_up(ax, X[np.atleast_1d(handles)], s=36, color=HANDLE_C, label="handle")
+    setup_axes_y_up(ax, lims if lims is not None else auto_limits_3d([X]), title=title,
+                    elev=elev, azim=azim)
+    return coll
+
+
+def animate_surface_y_up(frame_polys, *, lims, ghost_polys=None, title="", facecolor="#fc9272",
+                         edgecolor=(0.3, 0.0, 0.0, 0.25), lw=0.2, fps=20, figsize=(8, 5),
+                         elev=18, azim=-60, texts=None):
+    """Animate a deforming 3D surface with y drawn up. ``frame_polys[i]`` is frame
+    ``i`` as ``(k, 3, 3)`` triangles (e.g. a sampled curved P2 surface);
+    ``ghost_polys`` (optional) is drawn once, faint, as the rest shape; ``texts[i]``
+    (optional) is a per-frame caption. Returns ``(fig, anim)``."""
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection="3d")
+    if ghost_polys is not None:
+        surface_y_up(ax, ghost_polys, facecolor=MESH_FACE, edgecolor="none", alpha=0.2)
+    surf = surface_y_up(ax, frame_polys[0], facecolor=facecolor, edgecolor=edgecolor,
+                        lw=lw, alpha=0.97)
+    setup_axes_y_up(ax, lims, title=title, elev=elev, azim=azim)
+    txt = None
+    if texts is not None:
+        txt = ax.text2D(0.03, 0.93, texts[0], transform=ax.transAxes, family="monospace",
+                        fontsize=10, va="top")
+
+    def update(i):
+        surf.set_verts(to_display_y_up(frame_polys[i]))
+        if txt is not None:
+            txt.set_text(texts[i])
+        return ()
+
+    anim = FuncAnimation(fig, update, frames=len(frame_polys), interval=1000 / fps, blit=False)
+    return fig, anim
+
+
+import os
+
+
+def notebook_results_path(notebook_name, filename=None, root="results", mkdir=True):
+    """Path to a notebook's results folder, ``<root>/<notebook_name>/`` (rule 5).
+
+    Every file a notebook writes (plots, videos, caches) lives under one folder
+    named after the notebook. Pass ``filename`` to get a file path inside it.
+    The folder is created unless ``mkdir=False``.
+    """
+    folder = os.path.join(root, notebook_name)
+    if mkdir:
+        os.makedirs(folder, exist_ok=True)
+    if filename is None:
+        return folder
+    return os.path.join(folder, filename)
+
+
+def arc_polyline(length, n_nodes, total_turn):
+    """Nodes (n_nodes, 2) of a polyline of the given length bent into a circular arc.
+
+    The n_nodes - 1 equal segments turn by the same angle total_turn / (n_nodes - 1) at every
+    interior node, so the arc starts at the origin and is symmetric about its midpoint
+    (headings run from -total_turn/2 to +total_turn/2).
+    """
+    l_seg = length / (n_nodes - 1)
+    dphi = total_turn / (n_nodes - 1)                                    # heading change per segment
+    headings = -0.5 * total_turn + dphi * (np.arange(n_nodes - 1) + 0.5)
+    steps = l_seg * np.stack([np.cos(headings), np.sin(headings)], axis=1)
+    return np.vstack([np.zeros((1, 2)), np.cumsum(steps, axis=0)])
