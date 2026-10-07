@@ -1838,3 +1838,47 @@ def arc_polyline(length, n_nodes, total_turn):
     headings = -0.5 * total_turn + dphi * (np.arange(n_nodes - 1) + 0.5)
     steps = l_seg * np.stack([np.cos(headings), np.sin(headings)], axis=1)
     return np.vstack([np.zeros((1, 2)), np.cumsum(steps, axis=0)])
+
+
+# =============================================================================
+# Tapered capsule (tutorial 026)
+# =============================================================================
+
+def tapered_capsule_mesh(length=4.0, r_base=0.6, r_tip=0.45, interfaces=(), *, max_area=0.004,
+                         n_cap=24, n_side=60, n_interface=14):
+    """Triangle mesh of a tapered capsule: a body from ``x = 0`` to ``x = length`` whose
+    half-thickness shrinks linearly from ``r_base`` to ``r_tip``, closed by two semicircular caps.
+
+    ``interfaces`` are x-positions inside the body at which a vertical line of constraint
+    edges is inserted, so a per-triangle material that changes at those x-values has a clean
+    boundary. Meshed with ``igl.triangle.triangulate`` (``max_area`` per triangle). Returns
+    ``(X, T)``.
+    """
+    import igl.triangle
+
+    def half_width(x):
+        return r_base + (r_tip - r_base) * np.clip(x, 0.0, length) / length
+
+    interfaces = [xb for xb in interfaces if 0.0 < xb < length]
+    xs = np.union1d(np.linspace(0.0, length, n_side), interfaces)
+    top = np.c_[xs, half_width(xs)]
+    th = np.linspace(np.pi / 2, -np.pi / 2, n_cap)[1:-1]
+    cap_tip = np.c_[length + r_tip * np.cos(th), r_tip * np.sin(th)]
+    bottom = top[::-1] * [1.0, -1.0]
+    th = np.linspace(-np.pi / 2, -3 * np.pi / 2, n_cap)[1:-1]
+    cap_base = np.c_[r_base * np.cos(th), r_base * np.sin(th)]
+    P = np.vstack([top, cap_tip, bottom, cap_base])
+    E = np.c_[np.arange(len(P)), np.roll(np.arange(len(P)), -1)]
+
+    V, Es = [P], [E]
+    for xb in interfaces:                      # vertical chain from the top outline vertex to the bottom one
+        i_top = int(np.argmin(np.hypot(P[:, 0] - xb, P[:, 1] - half_width(xb))))
+        i_bot = int(np.argmin(np.hypot(P[:, 0] - xb, P[:, 1] + half_width(xb))))
+        ys = np.linspace(half_width(xb), -half_width(xb), n_interface)[1:-1]
+        base = sum(len(v) for v in V)
+        V.append(np.c_[np.full_like(ys, xb), ys])
+        chain = np.r_[i_top, base + np.arange(len(ys)), i_bot]
+        Es.append(np.c_[chain[:-1], chain[1:]])
+    V, E = np.vstack(V), np.vstack(Es)
+    X, T, _, _, _ = igl.triangle.triangulate(V, E, flags=f"qa{max_area}Q")
+    return X, T
